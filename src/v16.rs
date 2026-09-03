@@ -18189,22 +18189,50 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         // fee entirely — protocol/LP/creator/insurance all get 0. Widening to
         // "taker paid nothing for any reason" closes that revenue leak
         // (security review 2026-07-15, MEDIUM).
+        // GH#133: the trigger is a SHORTFALL, not a zero.
+        //
+        // `charge_account_fee_current_not_atomic` charges `fee.min(capital)` and
+        // returns what it actually took. Testing that against zero meant a taker
+        // who paid a single atom short of the fee was treated identically to one
+        // who paid in full: the fallback did not fire, the maker was never asked,
+        // and the remainder was collected from nobody. Protocol, LP, creator and
+        // insurance all silently received less than the fill earned.
+        //
+        // Two things follow from charging on shortfall instead.
+        //
+        // First, the maker is asked for the REMAINDER (`fee - taker_fee`), not for
+        // the full `fee`. Asking for the full amount after the taker already paid
+        // part of it would over-collect on exactly the partial-payment case this
+        // fixes.
+        //
+        // Second, BOTH return values can now be non-zero — previously exactly one
+        // was. That is safe here: the caller accumulates `fee_a` and `fee_b`
+        // additively into the trade outcome rather than treating them as mutually
+        // exclusive alternatives.
+        //
+        // The taker_fee == 0 case is unchanged: shortfall == fee, the maker is
+        // asked for the whole thing, and the pair is (0, fee) exactly as before.
+        // So this strictly widens when the fallback fires and changes nothing that
+        // already worked — including the deliberate absence of a `pnl < 0`
+        // qualifier described above.
         if taker_is_long_account {
             let taker_fee = self.charge_account_fee_current_not_atomic(long_account, fee)?;
-            if taker_fee == 0 && fee != 0 {
+            let shortfall = fee.saturating_sub(taker_fee);
+            if shortfall != 0 {
                 Ok((
-                    0u128,
-                    self.charge_account_fee_current_not_atomic(short_account, fee)?,
+                    taker_fee,
+                    self.charge_account_fee_current_not_atomic(short_account, shortfall)?,
                 ))
             } else {
                 Ok((taker_fee, 0u128))
             }
         } else {
             let taker_fee = self.charge_account_fee_current_not_atomic(short_account, fee)?;
-            if taker_fee == 0 && fee != 0 {
+            let shortfall = fee.saturating_sub(taker_fee);
+            if shortfall != 0 {
                 Ok((
-                    self.charge_account_fee_current_not_atomic(long_account, fee)?,
-                    0u128,
+                    self.charge_account_fee_current_not_atomic(long_account, shortfall)?,
+                    taker_fee,
                 ))
             } else {
                 Ok((0u128, taker_fee))
