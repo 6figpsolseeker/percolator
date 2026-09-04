@@ -22,7 +22,7 @@
 use percolator::{
     v16_domain_count_for_market_slots, EngineAssetSlotV16Account, Market,
     MarketGroupV16HeaderAccount, MarketGroupV16ViewMut, PortfolioAccountV16Account,
-    PortfolioV16ViewMut, ProvenanceHeaderV16, ProvenanceHeaderV16Account, PortfolioV16View,
+    PortfolioV16View, PortfolioV16ViewMut, ProvenanceHeaderV16, ProvenanceHeaderV16Account,
     V16Config, V16Error,
 };
 
