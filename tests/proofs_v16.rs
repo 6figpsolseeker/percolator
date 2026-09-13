@@ -8391,6 +8391,88 @@ fn proof_v16_terminal_source_haircut_retains_junior_face() {
     }
 }
 
+// upstream a4919ffa (INV-067/INV-071). A bounded resolved close realizes one
+// source domain per call, so the unconverted haircut of the domain just retired
+// must be RESERVED — counted out of the released PnL a later source may realize
+// — exactly once. Upstream states this as a `kani::ensures` contract on the
+// kernel plus a `#[kani::proof_for_contract]` harness that discards the result;
+// this fork has no `contracts` feature and no `cfg_attr`, so the proof carries
+// the whole statement. Covers are placed BEFORE the assertions on purpose: a
+// failing assert collapses every cover after it and reads exactly like vacuity.
+// Two statements are proved here that upstream's contract only implies:
+// the CounterOverflow arm is UNREACHABLE under the accepted preconditions, and
+// each of the three rejection guards is independently live.
+#[kani::proof]
+#[kani::unwind(4)]
+#[kani::solver(cadical)]
+fn proof_v16_terminal_source_haircut_reserved_exactly_once() {
+    let positive_pnl: u128 = kani::any();
+    let reserved_pnl: u128 = kani::any();
+    let source_attributed_face: u128 = kani::any();
+    let converted: u128 = kani::any();
+
+    let result = MarketGroupV16ViewMut::<u64>::kani_kernel_retain_terminal_source_haircut(
+        positive_pnl,
+        reserved_pnl,
+        source_attributed_face,
+        converted,
+    );
+
+    let accepted = reserved_pnl <= positive_pnl
+        && source_attributed_face <= positive_pnl - reserved_pnl
+        && converted <= source_attributed_face;
+
+    kani::cover!(
+        reserved_pnl > positive_pnl,
+        "rejects a reservation larger than the positive PnL it partitions"
+    );
+    kani::cover!(
+        reserved_pnl <= positive_pnl && source_attributed_face > positive_pnl - reserved_pnl,
+        "rejects source-attributed face reaching past the released PnL"
+    );
+    kani::cover!(
+        reserved_pnl <= positive_pnl
+            && source_attributed_face <= positive_pnl - reserved_pnl
+            && converted > source_attributed_face,
+        "rejects converting more than the domain's own attributed face"
+    );
+    kani::cover!(
+        accepted && converted < source_attributed_face,
+        "an under-backed domain reserves a nonzero haircut for the rest of the close"
+    );
+    kani::cover!(
+        accepted && converted == source_attributed_face && source_attributed_face != 0,
+        "a fully backed domain reserves nothing new"
+    );
+    kani::cover!(
+        accepted && reserved_pnl != 0 && converted < source_attributed_face,
+        "reservations accumulate across successive bounded calls"
+    );
+
+    if !accepted {
+        assert_eq!(result, Err(V16Error::InvalidLeg));
+        return;
+    }
+
+    // The accepted preconditions make reserved + (face - converted) <= positive_pnl,
+    // so the kernel's checked_add can never take its CounterOverflow arm.
+    let next_reserved = result.expect("accepted inputs must not overflow");
+
+    // The domain just retired contributes exactly its unconverted face.
+    assert_eq!(
+        next_reserved,
+        reserved_pnl + (source_attributed_face - converted)
+    );
+    // The reservation is still a partition of the surviving positive PnL.
+    assert!(next_reserved <= positive_pnl - converted);
+    // ...and the released remainder is EXACTLY the source face not yet processed,
+    // so no later source can realize this domain's haircut a second time.
+    assert_eq!(
+        (positive_pnl - converted) - next_reserved,
+        (positive_pnl - reserved_pnl) - source_attributed_face
+    );
+}
+
 #[kani::proof]
 #[kani::unwind(8)]
 #[kani::solver(cadical)]
