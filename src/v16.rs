@@ -8489,6 +8489,15 @@ impl<'a, T> MarketGroupV16View<'a, T> {
             // asset lifecycle, not market mode, so this intended transient asymmetry is
             // not flagged. Empty lifecycles are symmetric at 0, so only Recovery needs
             // the exemption; Active/DrainOnly enforcement is unchanged.
+            //
+            // Do NOT narrow this to `pending_obligation_count != 0`. That was tried
+            // (2026-09-14) and re-creates a false positive: a Recovery asset whose
+            // OPPOSITE side has already completed terminal wind-down holds a real
+            // position on one side and nothing on the other, with both obligation
+            // counts at 0 -- the very state `forfeit_recovery_leg_not_atomic`'s
+            // CommitRecovery arm exists for. Pinned by
+            // `v16_recovery_forfeit_commits_terminal_recovery_when_absorbing_side_is_empty`,
+            // whose fixture the narrower gate rejects before forfeit even runs.
             || (mode == MarketModeV16::Live
                 && asset.lifecycle != AssetLifecycleV16::Recovery
                 && asset.oi_eff_long_q != asset.oi_eff_short_q)
