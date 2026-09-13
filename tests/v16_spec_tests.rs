@@ -11385,6 +11385,123 @@ fn v16_resolved_close_normalizes_prospective_lapsed_source_before_settlement() {
     long.validate_with_market(&market.as_view()).unwrap();
 }
 
+// Fork regression, adjacent to upstream 50ae7b62's own spec test above.
+//
+// `expire_one_lapsed_source_backing_for_resolved_active_leg_not_atomic` scans
+// BOTH insurance domains of every leg slot, but only for slots whose leg is
+// ACTIVE. That `leg.active` guard is load-bearing and was untested: an empty
+// leg slot is `PortfolioLegV16::EMPTY`, whose `asset_index` is 0, so dropping
+// the guard silently aims the scan at asset 0's domains for all 16 static
+// slots. A resolved close would then expire a Fresh source-backing bucket in a
+// domain the closing account holds no leg in -- foreign backing normalized as
+// a side effect of an unrelated account's close.
+//
+// Here the only active leg is on asset 1 and the lapsed Fresh bucket sits on
+// asset 0 / Short (domain 1), so the guard is the only thing keeping the scan
+// off it. Removing `leg.active` flips the final assertion to `Expired`.
+#[test]
+fn v16_resolved_close_prospective_expiry_scan_skips_inactive_leg_slots() {
+    const Q: u128 = 1_000 * POS_SCALE;
+    let (market_id, _, _) = ids();
+    let mut cfg = V16Config::public_user_fund_with_market_slots(2, 2, 0, 10);
+    cfg.max_price_move_bps_per_slot = 500;
+    cfg.max_accrual_dt_slots = 1;
+    let mut header = MarketGroupV16HeaderAccount::new_dynamic(market_id, cfg, 2, 0).unwrap();
+    let mut markets = vec![
+        Market::new(0, EngineAssetSlotV16Account::default()),
+        Market::new(1, EngineAssetSlotV16Account::default()),
+    ];
+    header
+        .activate_empty_asset_slot_not_atomic(0, &mut markets[0].engine, 100, 1)
+        .unwrap();
+    header
+        .activate_empty_asset_slot_not_atomic(1, &mut markets[1].engine, 100, 2)
+        .unwrap();
+
+    let mut long_header = account_fixture(2, 50);
+    let mut short_header = account_fixture(2, 51);
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    let mut long = PortfolioV16ViewMut::new(&mut long_header);
+    let mut short = PortfolioV16ViewMut::new(&mut short_header);
+    market.deposit_not_atomic(&mut long, 1_000_000).unwrap();
+    market.deposit_not_atomic(&mut short, 1_000_000).unwrap();
+    // Lapsing Fresh backing on ASSET 0 / Short (domain 1). Neither account
+    // under test ever holds a leg on asset 0.
+    market
+        .deposit_fresh_counterparty_backing_not_atomic(1, 100_000, 3)
+        .unwrap();
+    // The only traded asset is ASSET 1.
+    market
+        .execute_trade_with_fee_loss_stale_scoped_not_atomic(
+            &mut long,
+            &mut short,
+            TradeRequestV16 {
+                asset_index: 1,
+                size_q: signed_q(Q),
+                exec_price: 100,
+                fee_bps: 0,
+            },
+            true,
+        )
+        .unwrap();
+    market
+        .set_asset_raw_oracle_target_not_atomic(1, 105)
+        .unwrap();
+    market
+        .accrue_asset_to_not_atomic(1, 3, 105, 0, true)
+        .unwrap();
+    market.resolve_market_not_atomic(4).unwrap();
+
+    // Slot 0 carries the asset-1 leg; every other static slot is EMPTY and
+    // therefore reports asset_index 0 -- the shape the guard has to survive.
+    let leg0 = long.header.legs[0].try_to_runtime().unwrap();
+    assert!(leg0.active);
+    assert_eq!(leg0.asset_index, 1);
+    for slot in 1..percolator::V16_MAX_PORTFOLIO_ASSETS_N {
+        let leg = long.header.legs[slot].try_to_runtime().unwrap();
+        assert!(!leg.active, "slot {} unexpectedly active", slot);
+        assert_eq!(leg.asset_index, 0, "empty slot {} asset_index", slot);
+    }
+    assert_eq!(
+        market.markets[0]
+            .engine
+            .backing_short
+            .try_to_runtime()
+            .unwrap()
+            .status,
+        BackingBucketStatusV16::Fresh,
+    );
+
+    // Crank the loss side first so the winner's positive payout can settle.
+    for account in [&mut short, &mut long] {
+        let mut steps = 0usize;
+        loop {
+            match market.close_resolved_account_not_atomic(account, 0) {
+                Ok(ResolvedCloseOutcomeV16::ProgressOnly) => {
+                    steps += 1;
+                    assert!(steps < 64, "resolved close did not terminate");
+                }
+                Ok(ResolvedCloseOutcomeV16::Closed { .. }) => break,
+                Err(e) => panic!("resolved close halted with {:?}", e),
+            }
+        }
+    }
+
+    assert_eq!(
+        market.markets[0]
+            .engine
+            .backing_short
+            .try_to_runtime()
+            .unwrap()
+            .status,
+        BackingBucketStatusV16::Fresh,
+        "an INACTIVE leg slot must not reach a foreign domain's source backing",
+    );
+    market.validate_shape().unwrap();
+    long.validate_with_market(&market.as_view()).unwrap();
+    short.validate_with_market(&market.as_view()).unwrap();
+}
+
 // upstream b4b975f3 "fix: allow lagging committed checkpoint accrual" (2026-08-31):
 // `now_slot` is the endpoint of one asset-local committed segment. Another asset can
 // already have advanced the market's authenticated clock past it, so a lagging asset
