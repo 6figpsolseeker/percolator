@@ -5678,6 +5678,13 @@ fn run_live_mark_reversal_unwinds_source_lien_before_claim_burn(insurance_backed
         .try_to_runtime()
         .unwrap();
     let insurance_before_reversal = market.header.insurance.get();
+    let risk_epoch_before_reversal = market.header.risk_epoch.get();
+    let source_credit_epoch_before_reversal = market.markets[0]
+        .engine
+        .source_credit_short
+        .try_to_runtime()
+        .unwrap()
+        .credit_epoch;
 
     market
         .set_asset_raw_oracle_target_not_atomic(0, 100)
@@ -5755,10 +5762,208 @@ fn run_live_mark_reversal_unwinds_source_lien_before_claim_burn(insurance_backed
         );
         assert_eq!(market.header.insurance.get(), insurance_before_reversal);
     }
+    // 4c4dfb20's fused burn advances the credit epoch by
+    // `1 + (source_claim_burn_num != 0)` so the two-in-one delta lands on the
+    // same epoch the legacy two-pass form reached. Nothing else in the engine
+    // binds the epoch's absolute value -- ReservationEncumbranceProofV16 carries
+    // source_credit_rate_num but no epoch field, and the only production
+    // inequality (the A-6 stress envelope) uses a strict `>` that +1 and +2
+    // satisfy identically -- so without these assertions the fused step is
+    // unobservable: de-fusing both call sites to a hardcoded `epoch_steps = 1`
+    // left the entire suite green (301/0 plain, 353/0 fuzz) while silently
+    // landing the reversal an epoch short (5/3 instead of 6/4).
+    assert_eq!(
+        market.header.risk_epoch.get() - risk_epoch_before_reversal,
+        6,
+        "the fused source-claim burn must contribute its own risk-epoch step"
+    );
+    assert_eq!(
+        market.markets[0]
+            .engine
+            .source_credit_short
+            .try_to_runtime()
+            .unwrap()
+            .credit_epoch
+            - source_credit_epoch_before_reversal,
+        4,
+        "the fused source-claim burn must contribute its own credit-epoch step"
+    );
     assert!(cert.valid);
     market.validate_shape().unwrap();
     long.validate_with_market(&market.as_view()).unwrap();
     short.validate_with_market(&market.as_view()).unwrap();
+}
+
+/// A PARTIAL mark reversal: the loss is smaller than the accumulated positive
+/// face, so 4c4dfb20's close-loss path burns only part of the account's source
+/// claim and the position is NOT fully unwound. The full-reversal fixtures above
+/// drive the same call with the whole face, so they cannot distinguish a
+/// proportional burn from a total one; this shape pins the arithmetic, and it
+/// reaches the fused burn inside
+/// `apply_haircut_bounded_close_loss_to_pnl` ->
+/// `consume_validated_account_source_credit_not_atomic` with a measured
+/// `preburned_source_claim_num` of exactly 2_100 * BOUND_SCALE.
+///
+/// It does NOT discriminate that call's `burn_account_claims = true` argument:
+/// flipping it to false leaves this test (and the whole suite) green, because
+/// `set_account_pnl_inner` (src/v16.rs:12813, writing at :12856 and :12864)
+/// independently reconciles BOTH the account's `source_claim_bound_num` and the
+/// domain's `positive_claim_bound_num` down to the new pnl. With a preburned
+/// count of 0 it simply performs the whole burn itself and lands on the same
+/// final state. The fused burn's only externally visible trace is therefore the
+/// credit/risk epoch it advances -- which is what the two epoch assertions in
+/// `run_live_mark_reversal_unwinds_source_lien_before_claim_burn` pin down.
+fn run_partial_mark_reversal_burns_only_matched_source_claim(insurance_backed: bool) {
+    const OPEN_Q: u128 = 1_000 * POS_SCALE;
+    const INCREASE_Q: u128 = 50 * POS_SCALE;
+    let (mut header, mut markets) = market_fixture(1, 100);
+    header.config.maintenance_margin_bps = V16PodU64::new(1_000);
+    header.config.initial_margin_bps = V16PodU64::new(5_000);
+    header.config.max_price_move_bps_per_slot = V16PodU64::new(500);
+    header.config.max_accrual_dt_slots = V16PodU64::new(1);
+    header.config.min_funding_lifetime_slots = V16PodU64::new(1);
+    let mut long_header = account_fixture(1, 10);
+    let mut short_header = account_fixture(1, 11);
+
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    let mut long = PortfolioV16ViewMut::new(&mut long_header);
+    let mut short = PortfolioV16ViewMut::new(&mut short_header);
+    if insurance_backed {
+        #[cfg(feature = "fuzz")]
+        {
+            market
+                .deposit_domain_insurance_not_atomic(1, 100_000)
+                .unwrap();
+            market
+                .reserve_insurance_credit_not_atomic(1, 100_000 * BOUND_SCALE)
+                .unwrap();
+        }
+        #[cfg(not(feature = "fuzz"))]
+        unreachable!("the insurance-backed variant requires the fuzz test API");
+    } else {
+        market
+            .deposit_fresh_counterparty_backing_not_atomic(1, 100_000, 100)
+            .unwrap();
+    }
+    market.deposit_not_atomic(&mut long, 52_501).unwrap();
+    market.deposit_not_atomic(&mut short, 1_000_000).unwrap();
+    market
+        .execute_trade_with_fee_loss_stale_scoped_not_atomic(
+            &mut long,
+            &mut short,
+            TradeRequestV16 {
+                asset_index: 0,
+                size_q: signed_q(OPEN_Q),
+                exec_price: 100,
+                fee_bps: 0,
+            },
+            true,
+        )
+        .unwrap();
+
+    market
+        .set_asset_raw_oracle_target_not_atomic(0, 105)
+        .unwrap();
+    market
+        .accrue_asset_to_not_atomic(0, 2, 105, 0, true)
+        .unwrap();
+    market.full_account_refresh_not_atomic(&mut short).unwrap();
+    market.full_account_refresh_not_atomic(&mut long).unwrap();
+    if insurance_backed {
+        let fresh_backing_atoms = market.markets[0]
+            .engine
+            .backing_short
+            .try_to_runtime()
+            .unwrap()
+            .fresh_unliened_backing_num
+            / BOUND_SCALE;
+        assert!(fresh_backing_atoms > 0);
+        market
+            .withdraw_fresh_counterparty_backing_not_atomic(1, fresh_backing_atoms)
+            .expect("reserved insurance must fully replace withdrawn counterparty backing");
+    }
+    assert_eq!(long.header.pnl.get(), 5_000);
+    market
+        .execute_trade_with_fee_loss_stale_scoped_not_atomic(
+            &mut long,
+            &mut short,
+            TradeRequestV16 {
+                asset_index: 0,
+                size_q: signed_q(INCREASE_Q),
+                exec_price: 105,
+                fee_bps: 0,
+            },
+            true,
+        )
+        .unwrap();
+    let lien_before = long.header.source_domains[0];
+    assert_eq!(long.header.pnl.get(), 5_000);
+    assert!(lien_before.source_claim_liened_num.get() > 0);
+    let claim_bound_before = lien_before.source_claim_bound_num.get();
+    assert!(claim_bound_before > 0);
+    let domain_claim_before = market.markets[0]
+        .engine
+        .source_credit_short
+        .try_to_runtime()
+        .unwrap()
+        .positive_claim_bound_num;
+
+    // PARTIAL reversal: 105 -> 103 leaves part of the +5_000 face standing.
+    market
+        .set_asset_raw_oracle_target_not_atomic(0, 103)
+        .unwrap();
+    market
+        .accrue_asset_to_not_atomic(0, 3, 103, 0, true)
+        .unwrap();
+    market.full_account_refresh_not_atomic(&mut short).unwrap();
+    market
+        .full_account_refresh_not_atomic(&mut long)
+        .expect("a partial mark reversal must settle");
+
+    let claim_bound_after = long.header.source_domains[0].source_claim_bound_num.get();
+    let domain_claim_after = market.markets[0]
+        .engine
+        .source_credit_short
+        .try_to_runtime()
+        .unwrap()
+        .positive_claim_bound_num;
+    // The reversal costs 2_100 of the standing 5_000 face, so 2_900 survives.
+    assert_eq!(long.header.pnl.get(), 2_900);
+    assert!(
+        claim_bound_after > 0,
+        "this fixture must leave a RESIDUAL source claim -- a full reversal zeroes \
+         the claim and cannot tell a proportional burn from a total one"
+    );
+    assert_eq!(
+        claim_bound_before - claim_bound_after,
+        2_100 * BOUND_SCALE,
+        "the account's source claim must retire exactly the face the loss consumed"
+    );
+    assert_eq!(
+        domain_claim_before - domain_claim_after,
+        2_100 * BOUND_SCALE,
+        "the domain's positive claim must retire the same face as the account's, \
+         not survive the loss it already paid for"
+    );
+    assert_eq!(
+        claim_bound_after,
+        long.header.pnl.get().unsigned_abs() * BOUND_SCALE,
+        "the surviving claim must track the surviving positive face"
+    );
+    market.validate_shape().unwrap();
+    long.validate_with_market(&market.as_view()).unwrap();
+    short.validate_with_market(&market.as_view()).unwrap();
+}
+
+#[test]
+fn v16_partial_mark_reversal_burns_only_matched_source_claim() {
+    run_partial_mark_reversal_burns_only_matched_source_claim(false);
+}
+
+#[cfg(feature = "fuzz")]
+#[test]
+fn v16_partial_mark_reversal_burns_only_matched_source_claim_insurance_backed() {
+    run_partial_mark_reversal_burns_only_matched_source_claim(true);
 }
 
 #[test]
