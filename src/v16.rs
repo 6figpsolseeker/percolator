@@ -14907,7 +14907,9 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         let pending_close = live && close_outstanding;
         // Expired outstanding close -> terminal recovery (Recover needs no leg).
         let expired_close = live && close_outstanding && now_slot > ledger.max_close_slot;
-        // liquidatable requires a current certified deficit AND actual open risk:
+        // liquidatable requires a current certified deficit AND actual open risk.
+        // Prior-reset obligations are settled/detached first through Refresh so
+        // they cannot block side finalization or poison liquidation dispatch:
         // a stale cert can still report a deficit after the position was already
         // closed, but with no active leg there is nothing to liquidate (the real
         // liquidate entrypoint requires an active leg), so the flag must be false.
