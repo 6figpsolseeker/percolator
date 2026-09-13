@@ -2100,6 +2100,16 @@ fn proof_v16_public_restart_rejects_spent_domain_before_mutation() {
     let slack_raw: u8 = kani::any();
     let price_raw: u16 = kani::any();
     kani::assume(spent_raw > 0);
+    // The rejection this harness proves is the PARTIALLY-spent one. The engine
+    // refuses in `clear_terminal_spent_domain_budget_pair` only when
+    // `budget != spent`, and this fixture builds `budget = spent + remaining`,
+    // so `budget == spent` exactly when `remaining == 0`. Upstream left
+    // `remaining_raw` unconstrained while asserting the rejection
+    // unconditionally, which makes the harness red on its own tree for the
+    // fully-spent case -- a case the engine restarts by design, and which its
+    // own first cover ("...with remaining budget...") shows it did not mean to
+    // include. The fully-spent branch is proved separately below.
+    kani::assume(remaining_raw > 0);
     kani::assume((1..=10_000).contains(&price_raw));
 
     let old_market_id = 1u64;
@@ -2252,6 +2262,99 @@ fn proof_v16_public_restart_rejects_spent_domain_before_mutation() {
         market.markets[0].engine.backing_short.market_id.get(),
         old_market_id
     );
+}
+
+/// The other half of `proof_v16_public_restart_rejects_spent_domain_before_mutation`,
+/// which upstream never covered: a **fully** spent insurance domain.
+///
+/// `clear_terminal_spent_domain_budget_pair` refuses only when `budget != spent`,
+/// because clearing a partially-spent pair would silently destroy the remaining
+/// budget. When `budget == spent` there is nothing left to lose, so the pair
+/// clears exactly to zero and the restart is allowed to proceed.
+///
+/// Upstream's harness asserts the rejection unconditionally while leaving
+/// `remaining_raw` unconstrained, so it is red on upstream's own tree for exactly
+/// this case. That harness is now scoped to `remaining > 0`; this one pins the
+/// branch it was leaving unproved.
+#[kani::proof]
+#[kani::unwind(4)]
+#[kani::solver(cadical)]
+fn proof_v16_public_restart_clears_a_fully_spent_domain() {
+    let restart_retired: bool = kani::any();
+    let spent_raw: u8 = kani::any();
+    let price_raw: u16 = kani::any();
+    kani::assume(spent_raw > 0);
+    kani::assume((1..=10_000).contains(&price_raw));
+
+    let old_market_id = 1u64;
+    let current_slot = 5u64;
+    let now_slot = 6u64;
+    // Fully spent: budget == spent, so the pair clears exactly and nothing is lost.
+    let spent = spent_raw as u128;
+    let budget = spent;
+
+    let (market_group_id, _, _) = ids();
+    let cfg = V16Config::public_user_fund_with_market_slots(1, 1, 0, 10);
+    let mut header = MarketGroupV16HeaderAccount::new_dynamic(market_group_id, cfg, 1, 0).unwrap();
+    header.current_slot = V16PodU64::new(current_slot);
+    header.slot_last = V16PodU64::new(current_slot);
+    header.next_market_id = V16PodU64::new(2);
+    header.asset_activation_count = V16PodU64::new(1);
+    header.last_asset_activation_slot = V16PodU64::new(current_slot);
+    header.asset_set_epoch = V16PodU64::new(3);
+    header.risk_epoch = V16PodU64::new(4);
+
+    let mut markets = [Market::new(
+        0u64,
+        EngineAssetSlotV16Account::empty_for_market(old_market_id),
+    )];
+    let mut old_asset = AssetStateV16::default();
+    old_asset.market_id = old_market_id;
+    old_asset.lifecycle = if restart_retired {
+        AssetLifecycleV16::Retired
+    } else {
+        AssetLifecycleV16::Recovery
+    };
+    old_asset.raw_oracle_target_price = 100;
+    old_asset.effective_price = 100;
+    old_asset.fund_px_last = 100;
+    old_asset.slot_last = current_slot;
+    old_asset.retired_slot = if restart_retired { current_slot } else { 0 };
+    markets[0].engine.asset = AssetStateV16Account::from_runtime(&old_asset);
+    markets[0].engine.insurance_domain_budget_long = V16PodU128::new(budget);
+    markets[0].engine.insurance_domain_spent_long = V16PodU128::new(spent);
+
+    let next_market_id_before = header.next_market_id.get();
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    let result = market.restart_empty_asset_preserving_insurance_budget_not_atomic(
+        0,
+        price_raw as u64,
+        now_slot,
+    );
+
+    kani::cover!(
+        restart_retired,
+        "fully-spent restart covers a retired source"
+    );
+    kani::cover!(
+        !restart_retired,
+        "fully-spent restart covers a recovery source"
+    );
+    kani::cover!(spent > 1, "fully-spent restart covers a multi-atom spend");
+
+    // The restart is ALLOWED: a fully-spent domain has no remaining budget to lose.
+    assert!(result.is_ok());
+    // And the spend record is cleared exactly, not carried into the new market.
+    assert_eq!(
+        market.markets[0].engine.insurance_domain_budget_long.get(),
+        0
+    );
+    assert_eq!(
+        market.markets[0].engine.insurance_domain_spent_long.get(),
+        0
+    );
+    // The restart really happened, rather than silently no-oping.
+    assert_ne!(market.header.next_market_id.get(), next_market_id_before);
 }
 
 #[kani::proof]
