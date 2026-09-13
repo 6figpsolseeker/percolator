@@ -791,3 +791,125 @@ proptest! {
         prop_assert!(market.header.vault.get() <= vault_before);
     }
 }
+
+/// Resolved winner holding TWO fully-backed source domains (domain 0 = asset 0
+/// long, domain 1 = asset 0 short), each with `pnl_per_domain` of source-backed
+/// claim covered 1:1 by `backing_per_domain` atoms of counterparty backing.
+fn resolved_market_with_two_backed_domains(
+    pnl_per_domain: u128,
+    backing_per_domain: u128,
+    extra_residual: u128,
+) -> (
+    MarketGroupV16HeaderAccount,
+    [Market<u64>; 1],
+    PortfolioAccountV16Account,
+) {
+    let total_pnl = pnl_per_domain * 2;
+    let total_backing = backing_per_domain * 2;
+    let claim_num = pnl_per_domain * BOUND_SCALE;
+    let backing_num = backing_per_domain * BOUND_SCALE;
+
+    let cfg = V16Config::public_user_fund_with_market_slots(1, 1, 0, 10);
+    let mut header = MarketGroupV16HeaderAccount::new_dynamic(market_id(), cfg, 1, 0).unwrap();
+    let mut markets = [Market::new(0u64, EngineAssetSlotV16Account::default())];
+    header
+        .activate_empty_asset_slot_not_atomic(0, &mut markets[0].engine, 100, 1)
+        .unwrap();
+    header.mode = 1; // Resolved
+    header.resolved_slot = V16PodU64::new(1);
+    header.current_slot = V16PodU64::new(1);
+    header.vault = V16PodU128::new(total_backing + extra_residual);
+    header.c_tot = V16PodU128::new(0);
+    header.pnl_pos_tot = V16PodU128::new(total_pnl);
+    header.pnl_matured_pos_tot = V16PodU128::new(total_pnl);
+    header.pnl_pos_bound_tot = V16PodU128::new(total_pnl);
+    header.pnl_pos_bound_tot_num = V16PodU128::new(total_pnl * BOUND_SCALE);
+    header.source_claim_bound_total_num = V16PodU128::new(total_pnl * BOUND_SCALE);
+    header.source_fresh_backing_total_num = V16PodU128::new(total_backing * BOUND_SCALE);
+
+    let engine_market_id = markets[0].engine.asset.market_id.get();
+    let bucket = BackingBucketV16Account::from_runtime(&BackingBucketV16 {
+        market_id: engine_market_id,
+        fresh_unliened_backing_num: backing_num,
+        expiry_slot: 100,
+        status: BackingBucketStatusV16::Fresh,
+        ..BackingBucketV16::EMPTY
+    });
+    let credit = SourceCreditStateV16Account::from_runtime(&SourceCreditStateV16 {
+        positive_claim_bound_num: claim_num,
+        exact_positive_claim_num: claim_num,
+        fresh_reserved_backing_num: backing_num,
+        credit_rate_num: (backing_num * CREDIT_RATE_SCALE / claim_num).min(CREDIT_RATE_SCALE),
+        ..SourceCreditStateV16::EMPTY
+    });
+    markets[0].engine.backing_long = bucket;
+    markets[0].engine.backing_short = bucket;
+    markets[0].engine.source_credit_long = credit;
+    markets[0].engine.source_credit_short = credit;
+
+    let mut account_header = winner_account(0, total_pnl);
+    for (slot, domain) in [0usize, 1usize].into_iter().enumerate() {
+        account_header.source_domains[slot].domain = V16PodU32::new(domain as u32);
+        account_header.source_domains[slot].source_claim_market_id =
+            V16PodU64::new(engine_market_id);
+        account_header.source_domains[slot].source_claim_bound_num = V16PodU128::new(claim_num);
+    }
+    (header, markets, account_header)
+}
+
+/// a0e27950: terminal source realization is a BOUNDED CONTINUATION. A winner
+/// backed by two source domains must retire exactly ONE domain per crank call
+/// and report ProgressOnly while any source attribution remains, instead of
+/// sweeping every domain in a single unbounded instruction. Without the bound,
+/// a winner with enough funded domains exceeds the compute budget and its
+/// close can never land, stranding both its capital and its backed claim.
+#[test]
+fn terminal_close_realizes_one_source_domain_per_call() {
+    let pnl_per_domain = 1_000u128;
+    let backing_per_domain = 1_000u128; // fully backed: rate == CREDIT_RATE_SCALE
+    let (mut header, mut markets, mut account_header) =
+        resolved_market_with_two_backed_domains(pnl_per_domain, backing_per_domain, 0);
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    let mut account = PortfolioV16ViewMut::new(&mut account_header);
+    assert_eq!(market.validate_shape(), Ok(()));
+    assert_eq!(account.validate_with_market(&market.as_view()), Ok(()));
+
+    let vault_before = market.header.vault.get();
+    assert!(account.header.source_domains[0].is_occupied());
+    assert!(account.header.source_domains[1].is_occupied());
+
+    // Call 1: exactly one domain is realized; the other still carries its
+    // attribution, so the close reports progress rather than finalizing.
+    let first = market
+        .close_resolved_account_not_atomic(&mut account, 0)
+        .expect("first bounded continuation must not revert");
+    assert_eq!(first, ResolvedCloseOutcomeV16::ProgressOnly);
+    assert!(
+        account.header.source_domains[0].is_occupied(),
+        "one domain must still hold source attribution after the first call"
+    );
+    assert!(
+        !account.header.source_domains[1].is_occupied(),
+        "the second slot must be free after compaction of the realized domain"
+    );
+    assert_eq!(market.validate_shape(), Ok(()));
+    assert_eq!(account.validate_with_market(&market.as_view()), Ok(()));
+
+    // Call 2: the last domain is realized and the account closes, paying the
+    // full face — the bound changes the number of calls, never the partition.
+    let second = market
+        .close_resolved_account_not_atomic(&mut account, 0)
+        .expect("final bounded continuation must not revert");
+    assert_eq!(
+        second,
+        ResolvedCloseOutcomeV16::Closed {
+            payout: pnl_per_domain * 2
+        }
+    );
+    assert!(!account.header.source_domains[0].is_occupied());
+    assert_eq!(account.header.pnl.get(), 0);
+    assert_eq!(account.header.capital.get(), 0);
+    assert_eq!(vault_before - market.header.vault.get(), pnl_per_domain * 2);
+    assert_eq!(market.validate_shape(), Ok(()));
+    assert_eq!(account.validate_with_market(&market.as_view()), Ok(()));
+}
