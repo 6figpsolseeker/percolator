@@ -1023,3 +1023,237 @@ fn bounded_terminal_source_realization_preserves_intermediate_attribution() {
     assert_eq!(account.validate_with_market(&market.as_view()), Ok(()));
     assert_eq!(market.validate_shape(), Ok(()));
 }
+
+/// Two source domains on different assets whose claim face EXCEEDS the
+/// winner's positive PnL. The account invariant is
+/// `source_claim_sum >= bound(pnl)` (a source-claiming winner's positive PnL is
+/// entirely source-attributed), so claim > PnL is a normal, shape-valid state.
+fn resolved_market_with_overclaimed_sources(
+    pnl: u128,
+    claim_per_source: u128,
+    backing: [u128; 2],
+    extra_residual: u128,
+) -> (
+    MarketGroupV16HeaderAccount,
+    [Market<u64>; 2],
+    PortfolioAccountV16Account,
+) {
+    let cfg = V16Config::public_user_fund_with_market_slots(2, 2, 0, 10);
+    let mut header = MarketGroupV16HeaderAccount::new_dynamic(market_id(), cfg, 2, 0).unwrap();
+    let mut markets = [
+        Market::new(0u64, EngineAssetSlotV16Account::default()),
+        Market::new(0u64, EngineAssetSlotV16Account::default()),
+    ];
+    for (asset_index, market) in markets.iter_mut().enumerate() {
+        header
+            .activate_empty_asset_slot_not_atomic(
+                asset_index as u32,
+                &mut market.engine,
+                100,
+                asset_index as u64 + 1,
+            )
+            .unwrap();
+        let backing_num = backing[asset_index] * BOUND_SCALE;
+        market.engine.backing_long = BackingBucketV16Account::from_runtime(&BackingBucketV16 {
+            market_id: market.engine.asset.market_id.get(),
+            fresh_unliened_backing_num: backing_num,
+            expiry_slot: 100,
+            status: BackingBucketStatusV16::Fresh,
+            ..BackingBucketV16::EMPTY
+        });
+        market.engine.source_credit_long =
+            SourceCreditStateV16Account::from_runtime(&SourceCreditStateV16 {
+                positive_claim_bound_num: claim_per_source * BOUND_SCALE,
+                exact_positive_claim_num: claim_per_source * BOUND_SCALE,
+                fresh_reserved_backing_num: backing_num,
+                credit_rate_num: (backing[asset_index] * CREDIT_RATE_SCALE / claim_per_source)
+                    .min(CREDIT_RATE_SCALE),
+                ..SourceCreditStateV16::EMPTY
+            });
+    }
+    let total_claim = 2 * claim_per_source;
+    // A SECOND, claim-free winner's positive PnL also sits in the market totals.
+    // The market invariant is source_claim_bound_total <= pnl_pos_bound_tot
+    // (v16.rs:8212) while the per-account invariant is the other way round --
+    // source_claim_sum >= bound(this account's pnl). Both hold here, so an
+    // account whose own claim face exceeds its own PnL is shape-valid.
+    let market_pnl = total_claim;
+    header.mode = 1;
+    header.resolved_slot = V16PodU64::new(2);
+    header.current_slot = V16PodU64::new(2);
+    header.vault = V16PodU128::new(backing.iter().sum::<u128>() + extra_residual);
+    header.pnl_pos_tot = V16PodU128::new(market_pnl);
+    header.pnl_matured_pos_tot = V16PodU128::new(market_pnl);
+    header.pnl_pos_bound_tot = V16PodU128::new(market_pnl);
+    header.pnl_pos_bound_tot_num = V16PodU128::new(market_pnl * BOUND_SCALE);
+    header.source_claim_bound_total_num = V16PodU128::new(total_claim * BOUND_SCALE);
+    header.source_fresh_backing_total_num =
+        V16PodU128::new(backing.iter().sum::<u128>() * BOUND_SCALE);
+
+    let mut account = winner_account(0, pnl);
+    for (slot, domain) in [0u32, 2].into_iter().enumerate() {
+        let asset_index = domain as usize / 2;
+        account.source_domains[slot].domain = V16PodU32::new(domain);
+        account.source_domains[slot].source_claim_market_id =
+            V16PodU64::new(markets[asset_index].engine.asset.market_id.get());
+        account.source_domains[slot].source_claim_bound_num =
+            V16PodU128::new(claim_per_source * BOUND_SCALE);
+    }
+    (header, markets, account)
+}
+
+/// a4919ffa, cap half. Once a bounded call RESERVES an unconverted haircut,
+/// the next call's realizable claim must be capped by the RELEASED PnL
+/// (`pos - reserved_pnl`), not by raw positive PnL. Capping by raw PnL asks
+/// `apply_released_pnl_conversion_with_consumption_core_not_atomic` to convert
+/// more than `pos - reserved_pnl`, which it refuses with InvalidConfig -- so
+/// the second bounded call REVERTS and the winner is stranded half-converted:
+/// 150 already in senior capital, 250 of junior PnL and a fully funded second
+/// domain, with CloseResolved erroring on every retry.
+#[test]
+fn bounded_terminal_realization_caps_the_next_domain_by_released_pnl() {
+    let (mut header, mut markets, mut account_header) =
+        resolved_market_with_overclaimed_sources(400, 300, [150, 300], 150);
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    let mut account = PortfolioV16ViewMut::new(&mut account_header);
+    assert_eq!(market.validate_shape(), Ok(()));
+    assert_eq!(account.validate_with_market(&market.as_view()), Ok(()));
+    let vault_before = market.header.vault.get();
+
+    // Call 1 converts domain 0 at rate 0.5 and reserves its 150 of unconverted
+    // haircut face out of the released PnL.
+    assert_eq!(
+        market.close_resolved_account_not_atomic(&mut account, 0),
+        Ok(ResolvedCloseOutcomeV16::ProgressOnly)
+    );
+    assert_eq!(account.header.capital.get(), 150);
+    assert_eq!(account.header.pnl.get(), 250);
+    assert_eq!(account.header.reserved_pnl.get(), 150);
+    assert_eq!(account.validate_with_market(&market.as_view()), Ok(()));
+
+    // Call 2 must NOT revert: domain 2's 300 of claim is clamped to the 100 of
+    // still-released PnL before conversion.
+    let second = market
+        .close_resolved_account_not_atomic(&mut account, 0)
+        .expect("the second bounded call must not revert");
+    assert_eq!(second, ResolvedCloseOutcomeV16::Closed { payout: 314 });
+    assert_eq!(account.header.capital.get(), 0);
+    assert_eq!(account.header.pnl.get(), 0);
+    assert_eq!(account.header.reserved_pnl.get(), 0);
+    assert_eq!(vault_before - market.header.vault.get(), 314);
+    assert_eq!(market.validate_shape(), Ok(()));
+    assert_eq!(account.validate_with_market(&market.as_view()), Ok(()));
+}
+
+/// Domain 0 occupied but claim-FREE (it retains only accrued capital-at-risk
+/// fee revenue), domain 2 still carrying the winner's backed claim.
+/// `PortfolioSourceDomainV16Account::is_occupied()` is true on
+/// `source_lien_capital_at_risk_fee_revenue` alone (v16.rs:21556), and
+/// `compact_source_domains` sorts ascending by domain index, so the claim-free
+/// domain lands in slot 0 ahead of the claiming one.
+fn resolved_market_with_claim_free_leading_domain() -> (
+    MarketGroupV16HeaderAccount,
+    [Market<u64>; 2],
+    PortfolioAccountV16Account,
+) {
+    const CLAIM: u128 = 200;
+    const BACKING: u128 = 150;
+    const EXTRA_RESIDUAL: u128 = 100;
+    const STALE_FEE_REVENUE: u128 = 7;
+
+    let cfg = V16Config::public_user_fund_with_market_slots(2, 2, 0, 10);
+    let mut header = MarketGroupV16HeaderAccount::new_dynamic(market_id(), cfg, 2, 0).unwrap();
+    let mut markets = [
+        Market::new(0u64, EngineAssetSlotV16Account::default()),
+        Market::new(0u64, EngineAssetSlotV16Account::default()),
+    ];
+    for (asset_index, market) in markets.iter_mut().enumerate() {
+        header
+            .activate_empty_asset_slot_not_atomic(
+                asset_index as u32,
+                &mut market.engine,
+                100,
+                asset_index as u64 + 1,
+            )
+            .unwrap();
+    }
+    // Only asset 1 (domain 2) is funded; asset 0's domain carries no claim.
+    let backing_num = BACKING * BOUND_SCALE;
+    markets[1].engine.backing_long = BackingBucketV16Account::from_runtime(&BackingBucketV16 {
+        market_id: markets[1].engine.asset.market_id.get(),
+        fresh_unliened_backing_num: backing_num,
+        expiry_slot: 100,
+        status: BackingBucketStatusV16::Fresh,
+        ..BackingBucketV16::EMPTY
+    });
+    markets[1].engine.source_credit_long =
+        SourceCreditStateV16Account::from_runtime(&SourceCreditStateV16 {
+            positive_claim_bound_num: CLAIM * BOUND_SCALE,
+            exact_positive_claim_num: CLAIM * BOUND_SCALE,
+            fresh_reserved_backing_num: backing_num,
+            credit_rate_num: BACKING * CREDIT_RATE_SCALE / CLAIM,
+            ..SourceCreditStateV16::EMPTY
+        });
+
+    header.mode = 1;
+    header.resolved_slot = V16PodU64::new(2);
+    header.current_slot = V16PodU64::new(2);
+    header.vault = V16PodU128::new(BACKING + EXTRA_RESIDUAL);
+    header.pnl_pos_tot = V16PodU128::new(CLAIM);
+    header.pnl_matured_pos_tot = V16PodU128::new(CLAIM);
+    header.pnl_pos_bound_tot = V16PodU128::new(CLAIM);
+    header.pnl_pos_bound_tot_num = V16PodU128::new(CLAIM * BOUND_SCALE);
+    header.source_claim_bound_total_num = V16PodU128::new(CLAIM * BOUND_SCALE);
+    header.source_fresh_backing_total_num = V16PodU128::new(backing_num);
+
+    let mut account = winner_account(0, CLAIM);
+    // slot 0: domain 0, no claim, only retained capital-at-risk fee revenue.
+    account.source_domains[0].domain = V16PodU32::new(0);
+    account.source_domains[0].source_claim_market_id =
+        V16PodU64::new(markets[0].engine.asset.market_id.get());
+    account.source_domains[0].source_lien_capital_at_risk_fee_revenue =
+        V16PodU128::new(STALE_FEE_REVENUE);
+    // slot 1: domain 2, the funded claim.
+    account.source_domains[1].domain = V16PodU32::new(2);
+    account.source_domains[1].source_claim_market_id =
+        V16PodU64::new(markets[1].engine.asset.market_id.get());
+    account.source_domains[1].source_claim_bound_num = V16PodU128::new(CLAIM * BOUND_SCALE);
+    (header, markets, account)
+}
+
+/// a4919ffa, scan half. a0e27950 hard-coded `source_domains[0]` and errored
+/// InvalidLeg if that slot held no claim. `is_occupied()` is true on retained
+/// capital-at-risk fee revenue alone, and c0dec8ce's compaction sorts domains
+/// ascending, so a claim-free domain 0 sits ahead of the funded domain 2 --
+/// a state `validate_shape` and `validate_with_market` both ACCEPT. Scanning
+/// for the first domain that actually carries a claim is what keeps that
+/// winner closable; without it CloseResolved reverts on every call and the
+/// winner's whole backed claim is unreachable.
+#[test]
+fn terminal_realization_scans_past_a_claim_free_leading_domain() {
+    let (mut header, mut markets, mut account_header) =
+        resolved_market_with_claim_free_leading_domain();
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    let mut account = PortfolioV16ViewMut::new(&mut account_header);
+    assert_eq!(market.validate_shape(), Ok(()));
+    assert_eq!(account.validate_with_market(&market.as_view()), Ok(()));
+    assert!(account.header.source_domains[0].is_occupied());
+    assert_eq!(
+        account.header.source_domains[0]
+            .source_claim_bound_num
+            .get(),
+        0,
+        "slot 0 must be occupied but claim-free for this to be the scan's control"
+    );
+    let vault_before = market.header.vault.get();
+
+    let outcome = market
+        .close_resolved_account_not_atomic(&mut account, 0)
+        .expect("a claim-free leading domain must not make the close revert");
+    assert_eq!(outcome, ResolvedCloseOutcomeV16::Closed { payout: 200 });
+    assert_eq!(account.header.pnl.get(), 0);
+    assert_eq!(account.header.capital.get(), 0);
+    assert_eq!(vault_before - market.header.vault.get(), 200);
+    assert_eq!(market.validate_shape(), Ok(()));
+    assert_eq!(account.validate_with_market(&market.as_view()), Ok(()));
+}
