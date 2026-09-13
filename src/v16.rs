@@ -15000,12 +15000,14 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
     /// ENGINE asset self-selection (engine.md): scan the account's bounded legs and
     /// return, for each asset-scoped continuation, the engine-chosen asset_index —
     /// the FIRST active leg with pending B settlement (either a cached stale bit or
-    /// a current B target above its snapshot), and the FIRST active
-    /// leg whose asset is currently accrual/reduction-dispatchable (Active or
-    /// DrainOnly, used for both Liquidate and the ORDINARY refresh accrual
-    /// target), falling back — for refresh only — to the FIRST Recovery leg,
-    /// which takes the committed-state refresh path instead. Recovery legs are
-    /// never selected for accrual or liquidation: both reject their lifecycle. The
+    /// a current B target above its snapshot), the FIRST accrual-dispatchable
+    /// active leg (falling back to the FIRST Recovery leg for committed-state
+    /// refresh), and the FIRST live-reducible leg (liquidation). A prior-epoch
+    /// ResetPending leg is still refreshable, but
+    /// its effective OI was already removed by ADL; selecting it for liquidation
+    /// would fail before a later current-epoch leg could make progress. Recovery
+    /// legs use committed-state refresh only and are never selected for accrual
+    /// or liquidation. The
     /// selection is proven in-range / actionable / first-match / complete by the
     /// first_actionable_slot contract; the slot->asset_index and lifecycle filter
     /// are bound to production state here.
