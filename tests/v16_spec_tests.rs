@@ -7140,6 +7140,7 @@ fn v16_mutable_view_compacts_persisted_domain_indexed_source_claim_before_deposi
     header.pnl_pos_bound_tot_num = V16PodU128::new(claim_num);
     header.pnl_pos_bound_tot = V16PodU128::new(claim);
     header.source_claim_bound_total_num = V16PodU128::new(claim_num);
+    header.source_fresh_backing_total_num = V16PodU128::new(claim_num);
     account_header.pnl = V16PodI128::new(claim as i128);
     account_header.source_domains[1].domain = V16PodU32::new(1);
     account_header.source_domains[1].source_claim_market_id = V16PodU64::new(1);
