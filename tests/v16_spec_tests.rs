@@ -5942,6 +5942,200 @@ fn v16_auto_crank_releases_flat_source_credit_lien_for_conversion() {
     market.validate_shape().unwrap();
 }
 
+/// Two-asset analogue of `flat_source_credit_lien_fixture`: the same flat,
+/// funded, retained-lien account, but holding a source lien on BOTH assets'
+/// long domains, so the two Live source-lien continuations can be ordered
+/// against each other. (Upstream carries this as `flat_source_credit_lien_fixture(2)`.)
+#[allow(clippy::type_complexity)]
+fn flat_source_credit_lien_fixture_two_domains() -> (
+    MarketGroupV16HeaderAccount,
+    Vec<Market<u64>>,
+    PortfolioAccountV16Account,
+    [usize; 2],
+) {
+    const ASSETS: usize = 2;
+    let (mut header, mut markets) = market_fixture(ASSETS as u32, 1);
+    let mut winner_header = account_fixture(ASSETS as u32, 10);
+    let mut counterparty_header = account_fixture(ASSETS as u32, 11);
+    let claim = 100u128;
+    let claim_num = claim * BOUND_SCALE;
+    winner_header.pnl = V16PodI128::new((claim * ASSETS as u128) as i128);
+    for (a, market) in markets.iter_mut().enumerate().take(ASSETS) {
+        winner_header.source_domains[a].domain = V16PodU32::new((a * 2) as u32);
+        // market_fixture assigns asset i the market_id (i + 1); a source claim whose
+        // market_id does not match its domain's asset is rejected as HiddenLeg.
+        winner_header.source_domains[a].source_claim_market_id = V16PodU64::new((a + 1) as u64);
+        winner_header.source_domains[a].source_claim_bound_num = V16PodU128::new(claim_num);
+        market.engine.source_credit_long =
+            SourceCreditStateV16Account::from_runtime(&SourceCreditStateV16 {
+                positive_claim_bound_num: claim_num,
+                exact_positive_claim_num: claim_num,
+                fresh_reserved_backing_num: claim_num,
+                credit_rate_num: CREDIT_RATE_SCALE,
+                ..SourceCreditStateV16::EMPTY
+            });
+        market.engine.backing_long = BackingBucketV16Account::from_runtime(&BackingBucketV16 {
+            market_id: (a + 1) as u64,
+            fresh_unliened_backing_num: claim_num,
+            expiry_slot: 100,
+            status: BackingBucketStatusV16::Fresh,
+            ..BackingBucketV16::EMPTY
+        });
+    }
+    header.pnl_pos_tot = V16PodU128::new(claim * ASSETS as u128);
+    header.pnl_pos_bound_tot_num = V16PodU128::new(claim_num * ASSETS as u128);
+    header.pnl_pos_bound_tot = V16PodU128::new(claim * ASSETS as u128);
+    header.source_claim_bound_total_num = V16PodU128::new(claim_num * ASSETS as u128);
+    header.vault = V16PodU128::new(claim * ASSETS as u128);
+    header.source_fresh_backing_total_num = V16PodU128::new(claim_num * ASSETS as u128);
+    {
+        let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+        let mut counterparty = PortfolioV16ViewMut::new(&mut counterparty_header);
+        market
+            .deposit_not_atomic(&mut counterparty, 10_000)
+            .unwrap();
+    }
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    let mut winner = PortfolioV16ViewMut::new(&mut winner_header);
+    let mut counterparty = PortfolioV16ViewMut::new(&mut counterparty_header);
+    // The winner is deliberately UNFUNDED: the IM lien only forms when a
+    // risk-increasing trade must lean on source-backed PnL rather than the
+    // account's own capital, so depositing to the winner would silently produce
+    // a fixture with no lien at all. Only asset 0 is traded -- the second source
+    // domain needs to be OCCUPIED, not liened, because
+    // `first_lapsed_source_backing_for_account_at_slot` scans every occupied
+    // source domain regardless of whether it carries a lien.
+    // Taker-only fee (fork): fee_bps is 0, so `taker_is_long_account` is inert.
+    let open = TradeRequestV16 {
+        asset_index: 0,
+        size_q: signed_q(10 * POS_SCALE),
+        exec_price: 1,
+        fee_bps: 0,
+    };
+    market
+        .execute_trade_with_fee_loss_stale_scoped_not_atomic(
+            &mut winner,
+            &mut counterparty,
+            open,
+            true,
+        )
+        .unwrap();
+    market
+        .execute_trade_with_fee_loss_stale_scoped_not_atomic(
+            &mut winner,
+            &mut counterparty,
+            TradeRequestV16 {
+                size_q: -open.size_q,
+                ..open
+            },
+            true,
+        )
+        .unwrap();
+    drop(market);
+    drop(winner);
+    drop(counterparty);
+    (header, markets, winner_header, [0, 2])
+}
+
+/// 6c8d94bc adds `!lapsed_source_backing` to the flat-lien class, ORDERING two
+/// continuations that were previously mutually blind. Clock-driven backing
+/// expiry is market-wide state every co-tenant depends on, so it must be
+/// canonicalized before this account's own lien normalization runs. Two liened
+/// source domains: one already globally `Impaired` (normalizable now) and one
+/// still `Fresh` but lapsed at the authenticated slot. The crank must reach the
+/// lapsed bucket FIRST.
+#[test]
+fn v16_auto_crank_expires_lapsed_source_backing_before_normalizing_an_impaired_lien() {
+    const NOW: u64 = 100;
+    let (mut header, mut markets, mut winner_header, domains) =
+        flat_source_credit_lien_fixture_two_domains();
+    let (impaired_domain, lapsed_domain) = (domains[0], domains[1]);
+    {
+        // Only the FIRST domain's bucket goes through the canonical expiry
+        // transition, as a co-tenant of that market-wide bucket would drive it.
+        // The second stays `Fresh` with expiry_slot <= NOW: lapsed, not yet
+        // canonicalized, and therefore visible ONLY to the lapsed-bucket class.
+        let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+        market
+            .expire_source_backing_bucket_not_atomic(impaired_domain, NOW)
+            .unwrap();
+    }
+    assert_eq!(
+        markets[0]
+            .engine
+            .backing_long
+            .try_to_runtime()
+            .unwrap()
+            .status,
+        BackingBucketStatusV16::Impaired,
+        "fixture must reach the globally impaired bucket"
+    );
+    let sibling = markets[1].engine.backing_long.try_to_runtime().unwrap();
+    assert_eq!(sibling.status, BackingBucketStatusV16::Fresh);
+    assert!(
+        sibling.expiry_slot <= NOW,
+        "the sibling bucket must be Fresh but lapsed, or the ordering is untested"
+    );
+
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    let mut winner = PortfolioV16ViewMut::new(&mut winner_header);
+    let observations = [
+        AutoCrankObservationV16 {
+            asset_index: 0,
+            effective_price: market.markets[0].engine.asset.effective_price.get(),
+            funding_rate_e9: 0,
+        },
+        AutoCrankObservationV16 {
+            asset_index: 1,
+            effective_price: market.markets[1].engine.asset.effective_price.get(),
+            funding_rate_e9: 0,
+        },
+    ];
+    let work = AutoCrankWorkV16 {
+        now_slot: NOW,
+        observations: &observations,
+        resolved_close_fee_rate_per_slot: 0,
+    };
+
+    let mut first_release_step: Option<usize> = None;
+    let mut lapsed_expiry_step: Option<usize> = None;
+    for step in 0..12usize {
+        let summary = market
+            .build_actionable_summary_at_slot(&winner.as_view(), NOW)
+            .unwrap();
+        if !summary.is_actionable() {
+            break;
+        }
+        let result = market
+            .permissionless_auto_crank_not_atomic(&mut winner, work)
+            .expect("every selected continuation must succeed");
+        if result.outcome
+            == AutoCrankOutcomeV16::Progressed(
+                PermissionlessProgressOutcomeV16::SourceBackingExpired {
+                    domain: lapsed_domain,
+                },
+            )
+        {
+            lapsed_expiry_step.get_or_insert(step);
+        }
+        if result.selected == AutoCrankPlanV16::ReleaseSourceLiens {
+            first_release_step.get_or_insert(step);
+        }
+    }
+    let release =
+        first_release_step.expect("the impaired lien must be normalized in finite cranks");
+    let expiry = lapsed_expiry_step
+        .expect("the lapsed sibling bucket must be canonicalized in finite cranks");
+    assert!(
+        expiry < release,
+        "lapsed backing must PRE-EMPT flat-lien normalization: expiry at step {expiry}, first \
+         release at step {release}"
+    );
+
+    winner.validate_with_market(&market.as_view()).unwrap();
+    market.validate_shape().unwrap();
+}
+
 /// 6c8d94bc ("Restore live progress for impaired source liens"). A flat, funded,
 /// margin-safe Live account whose counterparty backing bucket has already gone
 /// through the canonical expiry transition -- typically because a CO-TENANT of
