@@ -13474,9 +13474,12 @@ fn proof_v16_residual_excludes_recoverable_counterparty_backing_principal() {
 }
 
 // Terminal realization: face 3, backing 1, rate = floor(CRS/3) -> floored
-// entitlement is zero; realization must be a value-neutral no-op (nothing
-// consumed, nothing credited, the provider keeps the backing, the face stays
-// junior). CONCRETE WITNESS (flagged): symbolic harness times out — the
+// entitlement is zero; realization must be VALUE-neutral (nothing consumed,
+// nothing credited, the provider keeps the backing, the face stays junior as
+// ordinary PnL). Since a0e27950 it is not STATE-neutral: the bounded
+// continuation still retires that one domain's source attribution so the next
+// call advances, and reports progress. CONCRETE WITNESS (flagged): symbolic
+// harness times out — the
 // consume path's internal validate_with_market forces unwind 40 and the
 // per-domain U256 credit math blows up under a symbolic face. The symbolic
 // surface is covered end-to-end by the randomized properties in
@@ -13525,17 +13528,32 @@ fn proof_v16_terminal_realization_floored_rate_pays_zero_and_moves_nothing() {
     let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
     let mut account = PortfolioV16ViewMut::new(&mut account_header);
 
-    let converted = market
-        .kani_realize_source_backed_claims_for_resolved_close_not_atomic(&mut account)
+    let progressed = market
+        .kani_realize_one_source_domain_for_resolved_close_not_atomic(&mut account)
         .unwrap();
 
     kani::cover!(true, "floored-rate realization witness reached");
+    kani::cover!(
+        progressed,
+        "the bounded continuation consumed its one domain"
+    );
+    // The bounded continuation always retires exactly one canonical domain, even
+    // when the floored entitlement pays nothing (a0e27950).
+    assert!(progressed);
     // Floored entitlement is zero: nothing consumed, nothing credited.
-    assert_eq!(converted, 0);
     // Provider keeps the backing, face stays junior.
     assert_eq!(market.header.vault.get(), backing);
     assert_eq!(market.header.c_tot.get(), 0);
     assert_eq!(account.header.pnl.get(), pnl as i128);
+    // The face survives as ORDINARY junior PnL: only the source-specific backing
+    // attribution is terminally removed, so no second domain can realize it.
+    assert_eq!(
+        account.header.source_domains[0]
+            .source_claim_bound_num
+            .get(),
+        0
+    );
+    assert_eq!(market.header.source_claim_bound_total_num.get(), 0);
     assert_eq!(market.validate_shape(), Ok(()));
     assert_eq!(account.validate_with_market(&market.as_view()), Ok(()));
 }

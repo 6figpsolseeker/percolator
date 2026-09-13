@@ -2134,6 +2134,40 @@ fn v16_resolved_close_detaches_one_solvent_leg_per_call() {
 }
 
 #[test]
+fn v16_resolved_auto_crank_closes_capital_only_account() {
+    let (mut header, mut markets) = market_fixture(1, 100);
+    let mut account_header = account_fixture(1, 205);
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    let mut account = PortfolioV16ViewMut::new(&mut account_header);
+    market.deposit_not_atomic(&mut account, 1_000).unwrap();
+    let resolved_slot = market.header.current_slot.get();
+    market.resolve_market_not_atomic(resolved_slot).unwrap();
+
+    let summary = market
+        .build_actionable_summary(&account.as_view())
+        .expect("capital-only resolved account must classify");
+    assert!(summary.resolved_winner);
+    let result = market
+        .permissionless_auto_crank_not_atomic(
+            &mut account,
+            AutoCrankWorkV16 {
+                now_slot: resolved_slot,
+                observations: &[],
+                resolved_close_fee_rate_per_slot: 0,
+            },
+        )
+        .expect("permissionless close must return capital");
+    assert_eq!(result.selected, AutoCrankPlanV16::CloseResolved);
+    assert_eq!(
+        result.outcome,
+        AutoCrankOutcomeV16::ResolvedClose(ResolvedCloseOutcomeV16::Closed { payout: 1_000 })
+    );
+    assert_eq!(account.header.capital.get(), 0);
+    market.validate_shape().unwrap();
+    account.validate_with_market(&market.as_view()).unwrap();
+}
+
+#[test]
 fn v16_recovery_forfeit_migrates_legacy_normal_adl_residue_before_detach() {
     let (mut header, mut markets) = market_fixture(1, 100);
     let mut account_header = account_fixture(1, 27);
