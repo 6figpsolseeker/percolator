@@ -165,15 +165,19 @@ fn finalized_inert_close_progress(
 // consumer rounds per domain, delivered nothing, and the whole loss crank died
 // on `LockActive` forever.
 //
-// Fork note: upstream asserts the outcome is (0, 2) with pnl -1 because upstream
-// still clamps `junior_face_burned = old_positive_face` whenever any loss is
-// uncovered. This fork deliberately omits that clamp (#172 site 2 -- burning the
-// whole face double-charged the account), so the same fixture retains its
-// positive face and lands on (0, 0) with pnl +1. What the commit is about --
-// that the crank completes instead of returning LockActive -- is identical.
+// Fork note: at 592d538c upstream asserted (0, 2) with pnl -1, because it still
+// clamped `junior_face_burned = old_positive_face` whenever any loss was
+// uncovered. This fork never took that clamp (#172 site 2 -- burning the whole
+// face double-charged the account), so it has always retained the positive face
+// and landed on pnl +1. Upstream deleted the clamp in 07208fb1 and converged on
+// pnl +1 too, and in the same commit redefined the reported face burn as the
+// face that actually vanished: (0, 1), not (0, 0). The one atom of source claim
+// that the uncovered tail retires is now reported as burned instead of going
+// unattributed. What 592d538c is about -- that the crank completes instead of
+// returning LockActive -- is unchanged throughout.
 #[cfg(feature = "fuzz")]
 #[test]
-fn v16_cross_domain_fractional_source_loss_settles_without_locking() {
+fn v16_cross_domain_unbacked_loss_burns_only_matching_positive_face() {
     let (mut header, mut markets) = market_fixture(1, 100);
     let mut account_header = account_fixture(1, 250);
     let half_atom_num = BOUND_SCALE / 2;
@@ -221,14 +225,14 @@ fn v16_cross_domain_fractional_source_loss_settles_without_locking() {
         .expect("fractional source fixture must be a valid portfolio state");
     let outcome = market
         .kani_apply_signed_kf_delta_to_pnl(&mut account, -1, None)
-        .expect("an unbacked fractional-domain loss must remain settleable");
+        .expect("an unbacked cross-domain loss must remain settleable");
 
-    assert_eq!(outcome, (0, 0));
+    assert_eq!(outcome, (0, 1));
     assert_eq!(account.header.pnl.get(), 1);
     assert_eq!(market.header.pnl_pos_tot.get(), 1);
     // The uncovered atom of loss ate one atom of retained face, so exactly one
-    // atom of source claim retires with it (upstream burns both, having clamped
-    // junior_face_burned to the whole face).
+    // atom of source claim retires with it -- and that atom is exactly the
+    // `junior_face_burned = 1` the call reports.
     assert_eq!(
         market.header.source_claim_bound_total_num.get(),
         BOUND_SCALE

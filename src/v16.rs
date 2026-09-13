@@ -1661,6 +1661,28 @@ impl V16Core {
         Ok(raw_abs_q)
     }
 
+    /// Applies the uncovered tail of a loss after source support has already
+    /// burned `support_face_burned`. Uncovered loss consumes the retained
+    /// positive face one-for-one before creating negative PnL.
+    pub(crate) fn kernel_settle_positive_face_after_support(
+        old_positive_face: u128,
+        support_face_burned: u128,
+        remaining_loss: u128,
+    ) -> V16Result<(i128, u128)> {
+        if old_positive_face > i128::MAX as u128
+            || support_face_burned > old_positive_face
+            || remaining_loss > i128::MAX as u128
+        {
+            return Err(V16Error::ArithmeticOverflow);
+        }
+        let retained_face = old_positive_face - support_face_burned;
+        let new_pnl = (retained_face as i128)
+            .checked_sub(remaining_loss as i128)
+            .ok_or(V16Error::ArithmeticOverflow)?;
+        let total_face_burned = old_positive_face - new_pnl.max(0) as u128;
+        Ok((new_pnl, total_face_burned))
+    }
+
     /// Separates elective live source-credit conversion from mandatory terminal
     /// settlement. At terminal, only value actually converted to capital leaves
     /// the junior claim face; the source haircut remainder stays in the receipt
@@ -12967,7 +12989,7 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             });
         }
         let has_source_claims = Self::account_has_source_claims(&account.as_view())?;
-        let (support_consumed, junior_face_burned, preburned_source_claim_num) =
+        let (support_consumed, support_face_burned, preburned_source_claim_num) =
             if has_source_claims {
                 let source_support_limit = loss_abs.min(old_positive_face);
                 let (consumption, preburned_source_claim_num, support_consumed) = self
@@ -13011,22 +13033,17 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         // PROPORTIONAL: burn only the support-matched face, not the whole positive
         // face, on an under-supported loss. Burning it all double-charged the account
         // (accumulated gain destroyed AND the loss still taken from capital).
-        // Upstream still has `if remaining_loss != 0 { junior_face_burned =
-        // old_positive_face; }` here at 592d538c; this fork omits it (#172 site 2)
-        // and upstream itself deletes it later in 07208fb1.
-        if junior_face_burned > old_positive_face {
-            return Err(V16Error::ArithmeticOverflow);
-        }
-        let retained_face = old_positive_face
-            .checked_sub(junior_face_burned)
-            .ok_or(V16Error::ArithmeticOverflow)?;
-        let retained_i128 =
-            i128::try_from(retained_face).map_err(|_| V16Error::ArithmeticOverflow)?;
-        let remaining_i128 =
-            i128::try_from(remaining_loss).map_err(|_| V16Error::ArithmeticOverflow)?;
-        let new_pnl = retained_i128
-            .checked_sub(remaining_i128)
-            .ok_or(V16Error::ArithmeticOverflow)?;
+        // Upstream had `if remaining_loss != 0 { junior_face_burned =
+        // old_positive_face; }` here at 592d538c; this fork omitted it from the start
+        // (#172 site 2) and upstream deleted it in 07208fb1, which also moved the
+        // arithmetic into the kernel below and redefined the reported face burn as
+        // the face that actually vanished (support-matched burn PLUS the retained
+        // face the uncovered tail ate), not just the support-matched part.
+        let (new_pnl, junior_face_burned) = V16Core::kernel_settle_positive_face_after_support(
+            old_positive_face,
+            support_face_burned,
+            remaining_loss,
+        )?;
         account.header.reserved_pnl = V16PodU128::new(
             account
                 .header
@@ -17829,6 +17846,19 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
     #[cfg(kani)]
     pub fn kani_ensure_initial_margin(account: &PortfolioV16View<'_>) -> V16Result<()> {
         Self::ensure_initial_margin(account)
+    }
+
+    #[cfg(kani)]
+    pub fn kani_kernel_settle_positive_face_after_support(
+        old_positive_face: u128,
+        support_face_burned: u128,
+        remaining_loss: u128,
+    ) -> V16Result<(i128, u128)> {
+        V16Core::kernel_settle_positive_face_after_support(
+            old_positive_face,
+            support_face_burned,
+            remaining_loss,
+        )
     }
 
     #[cfg(kani)]
