@@ -1867,6 +1867,52 @@ impl V16Core {
         (None, false)
     }
 
+    /// Select one bounded flat-account source-lien transition. Impaired
+    /// counterparty backing is crystallized before any other component in that
+    /// domain; otherwise every live component must be current and releasable so
+    /// the per-domain release remains atomic. (upstream 6c8d94bc)
+    fn kernel_flat_source_lien_normalization(
+        source_claim_liened_num: u128,
+        counterparty_backing_num: u128,
+        insurance_backing_num: u128,
+        bucket_status: BackingBucketStatusV16,
+        bucket_expiry_slot: u64,
+        now_slot: u64,
+        bucket_valid_liened_num: u128,
+        bucket_impaired_liened_num: u128,
+        source_valid_liened_backing_num: u128,
+        source_impaired_liened_backing_num: u128,
+        reservation_valid_liened_insurance_num: u128,
+        source_valid_liened_insurance_num: u128,
+    ) -> FlatSourceLienNormalizationV16 {
+        if source_claim_liened_num == 0
+            || (counterparty_backing_num == 0 && insurance_backing_num == 0)
+        {
+            return FlatSourceLienNormalizationV16::None;
+        }
+        if counterparty_backing_num != 0
+            && bucket_status == BackingBucketStatusV16::Impaired
+            && bucket_impaired_liened_num >= counterparty_backing_num
+            && source_impaired_liened_backing_num >= counterparty_backing_num
+        {
+            return FlatSourceLienNormalizationV16::ImpairCounterparty;
+        }
+        let counterparty_releasable = counterparty_backing_num == 0
+            || (bucket_status == BackingBucketStatusV16::Fresh
+                && bucket_expiry_slot > now_slot
+                && bucket_valid_liened_num >= counterparty_backing_num
+                && source_valid_liened_backing_num >= counterparty_backing_num);
+        let insurance_releasable = insurance_backing_num == 0
+            || (insurance_backing_num % BOUND_SCALE == 0
+                && reservation_valid_liened_insurance_num >= insurance_backing_num
+                && source_valid_liened_insurance_num >= insurance_backing_num);
+        if counterparty_releasable && insurance_releasable {
+            FlatSourceLienNormalizationV16::Release
+        } else {
+            FlatSourceLienNormalizationV16::None
+        }
+    }
+
     /// PRODUCTION KERNEL: every Live account-local obligation serviced by the
     /// refresh continuation must make that continuation actionable. In
     /// particular, clock-driven backing expiry is independent of certificate
@@ -1880,6 +1926,21 @@ impl V16Core {
         lapsed_source_backing: bool,
     ) -> bool {
         live && (!cert_current || reset_obligation || released_obligation || lapsed_source_backing)
+    }
+
+    /// PRODUCTION KERNEL: a flat, current, margin-safe Live account with a
+    /// normalizable source lien is actionable -- but clock-driven backing expiry
+    /// outranks it, so a lapsed bucket must be canonicalized first.
+    /// (upstream 6c8d94bc)
+    fn kernel_live_flat_source_lien_normalization_required(
+        live: bool,
+        cert_current: bool,
+        lapsed_source_backing: bool,
+        flat: bool,
+        margin_safe: bool,
+        normalizable_lien: bool,
+    ) -> bool {
+        live && cert_current && !lapsed_source_backing && flat && margin_safe && normalizable_lien
     }
 
     /// Select the terminal owner-forfeit residual route. An unbookable positive
@@ -6651,6 +6712,15 @@ enum SourceCreditBackingSourceV16 {
     Insurance,
 }
 
+/// The single bounded transition a flat account's source-lien domain may take
+/// this call. (upstream 6c8d94bc)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FlatSourceLienNormalizationV16 {
+    None,
+    ImpairCounterparty,
+    Release,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RebalanceRequestV16 {
@@ -10262,12 +10332,17 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         false
     }
 
-    fn account_source_credit_liens_are_fresh_and_releasable(
+    /// 6c8d94bc renamed and inverted this from the all-domains "every lien is
+    /// fresh AND releasable" predicate into an any-domain "some lien has a
+    /// bounded transition" predicate. The old form returned false for a domain
+    /// whose bucket had already gone Impaired, and the lapsed-bucket selector
+    /// only sees `Fresh` buckets -- so a flat account holding an impaired lien
+    /// was invisible to every crank class at once.
+    fn account_has_normalizable_source_credit_lien(
         &self,
         account: &PortfolioV16View<'_>,
         now_slot: u64,
     ) -> V16Result<bool> {
-        let mut found = false;
         let mut slot = 0usize;
         while slot < PORTFOLIO_SOURCE_DOMAIN_CAP {
             let source = account.source_domains()[slot];
@@ -10275,35 +10350,34 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
                 break;
             }
             if source.is_occupied() && source.source_claim_liened_num.get() != 0 {
-                found = true;
                 let domain = source.domain.get() as usize;
                 self.domain_asset_side(domain)?;
                 let counterparty_backing = source.source_lien_counterparty_backing_num.get();
                 let insurance_backing = source.source_lien_insurance_backing_num.get();
                 let source_credit = self.source_credit_for_domain(domain)?;
-                if counterparty_backing != 0 {
-                    let bucket = self.backing_bucket_for_domain(domain)?;
-                    if bucket.status != BackingBucketStatusV16::Fresh
-                        || bucket.expiry_slot <= now_slot
-                        || bucket.valid_liened_backing_num < counterparty_backing
-                        || source_credit.valid_liened_backing_num < counterparty_backing
-                    {
-                        return Ok(false);
-                    }
-                }
-                if insurance_backing != 0 {
-                    let reservation = self.insurance_reservation_for_domain(domain)?;
-                    if insurance_backing % BOUND_SCALE != 0
-                        || reservation.valid_liened_insurance_num < insurance_backing
-                        || source_credit.valid_liened_insurance_num < insurance_backing
-                    {
-                        return Ok(false);
-                    }
+                let bucket = self.backing_bucket_for_domain(domain)?;
+                let reservation = self.insurance_reservation_for_domain(domain)?;
+                if V16Core::kernel_flat_source_lien_normalization(
+                    source.source_claim_liened_num.get(),
+                    counterparty_backing,
+                    insurance_backing,
+                    bucket.status,
+                    bucket.expiry_slot,
+                    now_slot,
+                    bucket.valid_liened_backing_num,
+                    bucket.impaired_liened_backing_num,
+                    source_credit.valid_liened_backing_num,
+                    source_credit.impaired_liened_backing_num,
+                    reservation.valid_liened_insurance_num,
+                    source_credit.valid_liened_insurance_num,
+                ) != FlatSourceLienNormalizationV16::None
+                {
+                    return Ok(true);
                 }
             }
             slot += 1;
         }
-        Ok(found)
+        Ok(false)
     }
 
     fn source_claim_unliened_num(account: &PortfolioV16View<'_>, domain: usize) -> V16Result<u128> {
@@ -12142,6 +12216,60 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             released_obligation,
             lapsed_source_backing,
         )
+    }
+
+    #[cfg(kani)]
+    pub fn kani_live_flat_source_lien_normalization_required(
+        live: bool,
+        cert_current: bool,
+        lapsed_source_backing: bool,
+        flat: bool,
+        margin_safe: bool,
+        normalizable_lien: bool,
+    ) -> bool {
+        V16Core::kernel_live_flat_source_lien_normalization_required(
+            live,
+            cert_current,
+            lapsed_source_backing,
+            flat,
+            margin_safe,
+            normalizable_lien,
+        )
+    }
+
+    #[cfg(kani)]
+    pub fn kani_flat_source_lien_normalization(
+        source_claim_liened_num: u128,
+        counterparty_backing_num: u128,
+        insurance_backing_num: u128,
+        bucket_status: BackingBucketStatusV16,
+        bucket_expiry_slot: u64,
+        now_slot: u64,
+        bucket_valid_liened_num: u128,
+        bucket_impaired_liened_num: u128,
+        source_valid_liened_backing_num: u128,
+        source_impaired_liened_backing_num: u128,
+        reservation_valid_liened_insurance_num: u128,
+        source_valid_liened_insurance_num: u128,
+    ) -> u8 {
+        match V16Core::kernel_flat_source_lien_normalization(
+            source_claim_liened_num,
+            counterparty_backing_num,
+            insurance_backing_num,
+            bucket_status,
+            bucket_expiry_slot,
+            now_slot,
+            bucket_valid_liened_num,
+            bucket_impaired_liened_num,
+            source_valid_liened_backing_num,
+            source_impaired_liened_backing_num,
+            reservation_valid_liened_insurance_num,
+            source_valid_liened_insurance_num,
+        ) {
+            FlatSourceLienNormalizationV16::None => 0,
+            FlatSourceLienNormalizationV16::ImpairCounterparty => 1,
+            FlatSourceLienNormalizationV16::Release => 2,
+        }
     }
 
     #[cfg(kani)]
@@ -14772,12 +14900,23 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             && has_open_risk
             && reset_obligation_asset.is_none();
         let no_positive_equity = Self::account_no_positive_credit_equity(account)?;
-        let source_liens_releasable = live
-            && cert_current
-            && active_bitmap_is_empty(account.header.active_bitmap.map(V16PodU64::get))
-            && no_positive_equity >= 0
-            && (no_positive_equity as u128) >= cert.certified_initial_req
-            && self.account_source_credit_liens_are_fresh_and_releasable(account, now_slot)?;
+        let flat = active_bitmap_is_empty(account.header.active_bitmap.map(V16PodU64::get));
+        let source_lien_margin_safe =
+            no_positive_equity >= 0 && (no_positive_equity as u128) >= cert.certified_initial_req;
+        let normalizable_source_lien =
+            if live && cert_current && !lapsed_source_backing && flat && source_lien_margin_safe {
+                self.account_has_normalizable_source_credit_lien(account, now_slot)?
+            } else {
+                false
+            };
+        let source_liens_releasable = V16Core::kernel_live_flat_source_lien_normalization_required(
+            live,
+            cert_current,
+            lapsed_source_backing,
+            flat,
+            source_lien_margin_safe,
+            normalizable_source_lien,
+        );
         // A completed account-local bankruptcy must not let that account force a
         // market-wide Recovery. In particular, a permissionless asset can be
         // attacker-controlled while unrelated assets remain healthy. Outstanding
@@ -19484,6 +19623,7 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             }
             let effective = source_snapshot.source_lien_effective_reserved.get();
             let counterparty_backing = source_snapshot.source_lien_counterparty_backing_num.get();
+            let insurance_backing = source_snapshot.source_lien_insurance_backing_num.get();
             if counterparty_backing != 0 {
                 let bucket = self.backing_bucket_for_domain(d)?;
                 if bucket.status == BackingBucketStatusV16::Fresh
@@ -19497,6 +19637,47 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
                         self.header.current_slot.get(),
                     )?;
                 }
+            }
+            // 6c8d94bc: a GLOBALLY impaired counterparty lien must first move into
+            // this account's impaired-claim lane. The release arm below zeroes
+            // `source_claim_liened_num` WITHOUT crediting `source_claim_impaired_num`,
+            // which is correct only for backing that is still valid: on an impaired
+            // bucket it would hand the account back `face` of UNLIENED source claim
+            // (`bound - liened - impaired` grows) against principal expiry already
+            // forfeited. Crystallize the utilization fee, retire the market-side
+            // impaired counters and relabel the account's claim instead, exactly as
+            // the Resolved wind-down already does in
+            // prepare_one_source_domain_for_resolved_close_not_atomic.
+            let bucket = self.backing_bucket_for_domain(d)?;
+            let source_credit = self.source_credit_for_domain(d)?;
+            let reservation = self.insurance_reservation_for_domain(d)?;
+            if V16Core::kernel_flat_source_lien_normalization(
+                source_snapshot.source_claim_liened_num.get(),
+                counterparty_backing,
+                insurance_backing,
+                bucket.status,
+                bucket.expiry_slot,
+                self.header.current_slot.get(),
+                bucket.valid_liened_backing_num,
+                bucket.impaired_liened_backing_num,
+                source_credit.valid_liened_backing_num,
+                source_credit.impaired_liened_backing_num,
+                reservation.valid_liened_insurance_num,
+                source_credit.valid_liened_insurance_num,
+            ) == FlatSourceLienNormalizationV16::ImpairCounterparty
+            {
+                self.collect_account_backing_utilization_fee_for_domain_not_atomic(account, d)?;
+                self.retire_source_credit_lien_from_counterparty_impaired_not_atomic(
+                    d,
+                    counterparty_backing,
+                )?;
+                let impaired_effective =
+                    Self::impair_account_source_credit_counterparty_lien_fields(account, d)?;
+                released_effective = released_effective
+                    .checked_add(impaired_effective)
+                    .ok_or(V16Error::ArithmeticOverflow)?;
+                slot += 1;
+                continue;
             }
             if effective != 0 {
                 released_effective = released_effective
