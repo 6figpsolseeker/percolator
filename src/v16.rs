@@ -18477,6 +18477,71 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         Ok(())
     }
 
+    /// Closes one opposite-side pair in Recovery while treating caller quantity as a work budget.
+    /// The canonical effective quantities, rather than retained raw bases, bound the landed close.
+    ///
+    /// Fork note (upstream `ce590d9b`): this fork's trade primitive carries the
+    /// taker-only fee selector `taker_is_long_account`, which upstream's
+    /// signature does not have. This path always trades at `fee_bps: 0`, so the
+    /// selector is a documented no-op here — `charge_trade_fee_taker_only_not_atomic`
+    /// resolves to `(0, 0)` on a zero requested fee whichever side is nominally
+    /// the taker (design §1A) — and `true` is passed in both orientations, which
+    /// is the same choice `handle_force_close_abandoned_asset` makes in the
+    /// wrapper.
+    pub fn force_close_recovery_pair_not_atomic(
+        &mut self,
+        account_a: &mut PortfolioV16ViewMut<'_>,
+        account_b: &mut PortfolioV16ViewMut<'_>,
+        asset_index: usize,
+        close_request_q: u128,
+    ) -> V16Result<u128> {
+        if decode_market_mode(self.header.mode)? != MarketModeV16::Live {
+            return Err(V16Error::LockActive);
+        }
+        if close_request_q == 0 {
+            return Err(V16Error::InvalidConfig);
+        }
+        self.validate_configured_asset_index(asset_index)?;
+        let asset = self.asset_state(asset_index)?;
+        if asset.lifecycle != AssetLifecycleV16::Recovery {
+            return Err(V16Error::LockActive);
+        }
+        let leg_a = Self::active_leg_for_asset(&account_a.as_view(), asset_index)?;
+        let leg_b = Self::active_leg_for_asset(&account_b.as_view(), asset_index)?;
+        if !leg_a.active || !leg_b.active || leg_a.side == leg_b.side {
+            return Err(V16Error::InvalidLeg);
+        }
+        let effective_a = V16Core::effective_abs_quantity_for_leg(asset, leg_a)?;
+        let effective_b = V16Core::effective_abs_quantity_for_leg(asset, leg_b)?;
+        let close_q = close_request_q
+            .min(effective_a)
+            .min(effective_b)
+            .min(asset.oi_eff_long_q)
+            .min(asset.oi_eff_short_q);
+        if close_q == 0 {
+            return Err(V16Error::NonProgress);
+        }
+        let size_q = i128::try_from(close_q).map_err(|_| V16Error::ArithmeticOverflow)?;
+        let request = TradeRequestV16 {
+            asset_index,
+            size_q,
+            exec_price: asset.effective_price,
+            fee_bps: 0,
+        };
+        // Positive `size_q` is applied to the first account and its negation to the second.
+        // Put the short first so both signed deltas move the existing legs toward zero.
+        if leg_a.side == SideV16::Short {
+            self.execute_trade_with_fee_loss_stale_scoped_not_atomic(
+                account_a, account_b, request, true,
+            )?;
+        } else {
+            self.execute_trade_with_fee_loss_stale_scoped_not_atomic(
+                account_b, account_a, request, true,
+            )?;
+        }
+        Ok(close_q)
+    }
+
     pub fn execute_trade_with_fee_loss_stale_scoped_not_atomic(
         &mut self,
         long_account: &mut PortfolioV16ViewMut<'_>,
