@@ -2506,6 +2506,340 @@ fn v16_post_quantity_adl_bankrupt_effective_full_close_stays_live() {
 }
 
 #[test]
+fn v16_recovery_pair_close_clamps_stale_work_to_dual_adl_effective_oi() {
+    const PRICE: u64 = 100;
+    const OPEN_Q: u128 = 2 * POS_SCALE;
+    const FIRST_REDUCE_Q: u128 = POS_SCALE / 100;
+    const SECOND_REDUCE_Q: u128 = POS_SCALE / 100;
+
+    let (mut header, mut markets) = market_fixture(1, PRICE);
+    let mut long_header = account_fixture(1, 229);
+    let mut short_header = account_fixture(1, 230);
+    {
+        let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+        let mut long = PortfolioV16ViewMut::new(&mut long_header);
+        let mut short = PortfolioV16ViewMut::new(&mut short_header);
+        market.deposit_not_atomic(&mut long, 10_000).unwrap();
+        market.deposit_not_atomic(&mut short, 10_000).unwrap();
+        market
+            .execute_trade_with_fee_loss_stale_scoped_not_atomic(
+                &mut long,
+                &mut short,
+                TradeRequestV16 {
+                    asset_index: 0,
+                    size_q: signed_q(OPEN_Q),
+                    exec_price: PRICE,
+                    fee_bps: 0,
+                },
+                true,
+            )
+            .unwrap();
+        market
+            .rebalance_reduce_position_not_atomic(
+                &mut long,
+                RebalanceRequestV16 {
+                    asset_index: 0,
+                    reduce_q: FIRST_REDUCE_Q,
+                },
+            )
+            .unwrap();
+        market
+            .rebalance_reduce_position_not_atomic(
+                &mut short,
+                RebalanceRequestV16 {
+                    asset_index: 0,
+                    reduce_q: SECOND_REDUCE_Q,
+                },
+            )
+            .unwrap();
+    }
+
+    let before = markets[0].engine.asset.try_to_runtime().unwrap();
+    let long_raw_q = long_header.legs[0]
+        .try_to_runtime()
+        .unwrap()
+        .basis_pos_q
+        .unsigned_abs();
+    let short_raw_q = short_header.legs[0]
+        .try_to_runtime()
+        .unwrap()
+        .basis_pos_q
+        .unsigned_abs();
+    assert!(before.a_long < ADL_ONE && before.a_short < ADL_ONE);
+    assert_eq!(before.oi_eff_long_q, before.oi_eff_short_q);
+    assert!(long_raw_q > before.oi_eff_long_q);
+    assert!(short_raw_q > before.oi_eff_short_q);
+    let effective_q = before.oi_eff_long_q;
+
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    market.force_asset_recovery_not_atomic(0, 1).unwrap();
+    let mut long = PortfolioV16ViewMut::new(&mut long_header);
+    let mut short = PortfolioV16ViewMut::new(&mut short_header);
+    let landed_q = market
+        .force_close_recovery_pair_not_atomic(
+            &mut long,
+            &mut short,
+            0,
+            effective_q.checked_add(1).unwrap(),
+        )
+        .expect("stale Recovery work must clamp to canonical effective OI");
+
+    assert_eq!(landed_q, effective_q);
+    let after = market.markets[0].engine.asset.try_to_runtime().unwrap();
+    assert_eq!(after.oi_eff_long_q, 0);
+    assert_eq!(after.oi_eff_short_q, 0);
+    market.validate_shape().unwrap();
+    long.validate_with_market(&market.as_view()).unwrap();
+    short.validate_with_market(&market.as_view()).unwrap();
+}
+
+/// The clamp has two independent families of bound: the two *per-leg*
+/// effective quantities and the two *side* effective OI totals. Upstream's own
+/// fixture cannot tell them apart — with one leg per side all four numbers are
+/// equal, so dropping either pair leaves the result unchanged.
+///
+/// This puts a second long leg on the asset, so `oi_eff_long_q` is strictly
+/// larger than the closing leg's own effective quantity. The pair close must
+/// then be bounded by the *pair*, not by the side total: a budget of
+/// `u128::MAX` may land only account A's own effective size, leaving account
+/// B's leg untouched. Without the per-leg bound the clamp would resolve to the
+/// side OI, ask for more than A holds, and the engine would refuse the whole
+/// close.
+#[test]
+fn v16_recovery_pair_close_clamps_to_the_pair_not_the_side_oi() {
+    const PRICE: u64 = 100;
+    let (mut header, mut markets) = market_fixture(1, PRICE);
+    let mut a_header = account_fixture(1, 240);
+    let mut b_header = account_fixture(1, 241);
+    let mut c_header = account_fixture(1, 242);
+    {
+        let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+        let mut a = PortfolioV16ViewMut::new(&mut a_header);
+        let mut b = PortfolioV16ViewMut::new(&mut b_header);
+        let mut c = PortfolioV16ViewMut::new(&mut c_header);
+        market.deposit_not_atomic(&mut a, 100_000).unwrap();
+        market.deposit_not_atomic(&mut b, 100_000).unwrap();
+        market.deposit_not_atomic(&mut c, 100_000).unwrap();
+        market
+            .execute_trade_with_fee_loss_stale_scoped_not_atomic(
+                &mut a,
+                &mut c,
+                TradeRequestV16 {
+                    asset_index: 0,
+                    size_q: signed_q(2 * POS_SCALE),
+                    exec_price: PRICE,
+                    fee_bps: 0,
+                },
+                true,
+            )
+            .unwrap();
+        market
+            .execute_trade_with_fee_loss_stale_scoped_not_atomic(
+                &mut b,
+                &mut c,
+                TradeRequestV16 {
+                    asset_index: 0,
+                    size_q: signed_q(POS_SCALE),
+                    exec_price: PRICE,
+                    fee_bps: 0,
+                },
+                true,
+            )
+            .unwrap();
+        market
+            .rebalance_reduce_position_not_atomic(
+                &mut a,
+                RebalanceRequestV16 {
+                    asset_index: 0,
+                    reduce_q: POS_SCALE / 100,
+                },
+            )
+            .unwrap();
+    }
+
+    let before = markets[0].engine.asset.try_to_runtime().unwrap();
+    let a_raw_q = a_header.legs[0]
+        .try_to_runtime()
+        .unwrap()
+        .basis_pos_q
+        .unsigned_abs();
+    // The long side took no haircut, so A's effective size is its raw basis —
+    // and it is strictly below the side total, which also carries B's leg.
+    assert_eq!(before.a_long, ADL_ONE);
+    assert!(a_raw_q < before.oi_eff_long_q);
+    let b_remaining_q = before.oi_eff_long_q - a_raw_q;
+    assert!(b_remaining_q > 0);
+
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    market.force_asset_recovery_not_atomic(0, 1).unwrap();
+    let mut a = PortfolioV16ViewMut::new(&mut a_header);
+    let mut c = PortfolioV16ViewMut::new(&mut c_header);
+    let landed_q = market
+        .force_close_recovery_pair_not_atomic(&mut a, &mut c, 0, u128::MAX)
+        .expect("an unbounded budget must clamp to the pair, not the side OI");
+
+    assert_eq!(landed_q, a_raw_q);
+    let after = market.markets[0].engine.asset.try_to_runtime().unwrap();
+    assert_eq!(after.oi_eff_long_q, b_remaining_q);
+    assert_eq!(after.oi_eff_short_q, b_remaining_q);
+    market.validate_shape().unwrap();
+    a.validate_with_market(&market.as_view()).unwrap();
+    c.validate_with_market(&market.as_view()).unwrap();
+}
+
+/// Upstream `ce590d9b` ("Fix Recovery pair close work clamping") adds
+/// `force_close_recovery_pair_not_atomic`: an entry point that treats the
+/// caller quantity as a *work budget* and clamps it to the canonical
+/// effective quantities — `min(effective_a, effective_b, oi_eff_long_q,
+/// oi_eff_short_q)` — before landing a Recovery pair close, so that a caller
+/// sizing its request from the retained raw basis cannot land more close work
+/// than actually exists.
+///
+/// This test locks the reason that clamp has to be written against effective
+/// quantities rather than raw bases. On the ordinary trade path the engine
+/// does not clamp an oversized Recovery close — it *refuses* it, via two
+/// independent gates: `require_asset_risk_change_allowed`'s ADL-haircut check
+/// (`a_long != ADL_ONE || a_short != ADL_ONE`) and `asset_risk_increase_gate`'s
+/// lifecycle check (`lifecycle != Active`), either of which alone rejects the
+/// over-request. So a caller that sizes a Recovery pair close from the
+/// retained raw basis does not merely overshoot — it gets `LockActive` and
+/// lands nothing, forever, because the raw basis stays above the canonical
+/// effective OI for as long as the ADL haircut stands.
+///
+/// That is not hypothetical: `handle_force_close_abandoned_asset` in
+/// percolator-prog (`src/v16_program.rs:9010-9015` @ `origin/main` 480e23a0)
+/// clamps to `leg.basis_pos_q.unsigned_abs()` on both legs, so instruction
+/// `ForceCloseAbandonedAsset` (wire tag 64) cannot close an ADL-haircut
+/// Recovery pair at all. `force_close_recovery_pair_not_atomic` above is the
+/// primitive that fixes it; this test pins the refusal that makes the raw
+/// clamp unusable, so the two cannot drift back apart.
+///
+/// Both halves are locked here: the over-request must be refused with the
+/// market left untouched, and the exact effective quantity must still drive
+/// the pair to zero with every validator green.
+#[test]
+fn v16_recovery_pair_close_refuses_stale_work_beyond_effective_oi() {
+    const PRICE: u64 = 100;
+    const OPEN_Q: u128 = 2 * POS_SCALE;
+    const FIRST_REDUCE_Q: u128 = POS_SCALE / 100;
+    const SECOND_REDUCE_Q: u128 = POS_SCALE / 100;
+
+    let (mut header, mut markets) = market_fixture(1, PRICE);
+    let mut long_header = account_fixture(1, 229);
+    let mut short_header = account_fixture(1, 230);
+    {
+        let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+        let mut long = PortfolioV16ViewMut::new(&mut long_header);
+        let mut short = PortfolioV16ViewMut::new(&mut short_header);
+        market.deposit_not_atomic(&mut long, 10_000).unwrap();
+        market.deposit_not_atomic(&mut short, 10_000).unwrap();
+        market
+            .execute_trade_with_fee_loss_stale_scoped_not_atomic(
+                &mut long,
+                &mut short,
+                TradeRequestV16 {
+                    asset_index: 0,
+                    size_q: signed_q(OPEN_Q),
+                    exec_price: PRICE,
+                    fee_bps: 0,
+                },
+                true,
+            )
+            .unwrap();
+        market
+            .rebalance_reduce_position_not_atomic(
+                &mut long,
+                RebalanceRequestV16 {
+                    asset_index: 0,
+                    reduce_q: FIRST_REDUCE_Q,
+                },
+            )
+            .unwrap();
+        market
+            .rebalance_reduce_position_not_atomic(
+                &mut short,
+                RebalanceRequestV16 {
+                    asset_index: 0,
+                    reduce_q: SECOND_REDUCE_Q,
+                },
+            )
+            .unwrap();
+    }
+
+    // The fixture must actually reach the state the clamp is about: both sides
+    // ADL-haircut, so each retained raw basis overstates the real exposure.
+    let before = markets[0].engine.asset.try_to_runtime().unwrap();
+    let long_raw_q = long_header.legs[0]
+        .try_to_runtime()
+        .unwrap()
+        .basis_pos_q
+        .unsigned_abs();
+    let short_raw_q = short_header.legs[0]
+        .try_to_runtime()
+        .unwrap()
+        .basis_pos_q
+        .unsigned_abs();
+    assert!(before.a_long < ADL_ONE && before.a_short < ADL_ONE);
+    assert_eq!(before.oi_eff_long_q, before.oi_eff_short_q);
+    assert!(long_raw_q > before.oi_eff_long_q);
+    assert!(short_raw_q > before.oi_eff_short_q);
+    let effective_q = before.oi_eff_long_q;
+
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    market.force_asset_recovery_not_atomic(0, 1).unwrap();
+    let recovered = market.markets[0].engine.asset.try_to_runtime().unwrap();
+    assert_eq!(recovered.lifecycle, AssetLifecycleV16::Recovery);
+    let exec_price = recovered.effective_price;
+    let mut long = PortfolioV16ViewMut::new(&mut long_header);
+    let mut short = PortfolioV16ViewMut::new(&mut short_header);
+
+    // Stale work budget: one quantum past the canonical effective OI. Upstream
+    // clamps this down; this fork refuses it outright. Either way the close
+    // must not land, and the refusal must leave the market untouched.
+    let refused = market.execute_trade_with_fee_loss_stale_scoped_not_atomic(
+        &mut short,
+        &mut long,
+        TradeRequestV16 {
+            asset_index: 0,
+            size_q: i128::try_from(effective_q.checked_add(1).unwrap()).unwrap(),
+            exec_price,
+            fee_bps: 0,
+        },
+        true,
+    );
+    assert_eq!(
+        refused.map(|outcome| outcome.notional),
+        Err(V16Error::LockActive),
+        "stale Recovery work past the canonical effective OI must not land"
+    );
+    let untouched = market.markets[0].engine.asset.try_to_runtime().unwrap();
+    assert_eq!(untouched.oi_eff_long_q, effective_q);
+    assert_eq!(untouched.oi_eff_short_q, effective_q);
+
+    // The canonical effective quantity still closes the pair completely, so the
+    // refusal above costs liveness nothing: nobody is stranded in Recovery.
+    market
+        .execute_trade_with_fee_loss_stale_scoped_not_atomic(
+            &mut short,
+            &mut long,
+            TradeRequestV16 {
+                asset_index: 0,
+                size_q: i128::try_from(effective_q).unwrap(),
+                exec_price,
+                fee_bps: 0,
+            },
+            true,
+        )
+        .expect("the canonical effective quantity must close the Recovery pair");
+    let after = market.markets[0].engine.asset.try_to_runtime().unwrap();
+    assert_eq!(after.oi_eff_long_q, 0);
+    assert_eq!(after.oi_eff_short_q, 0);
+    market.validate_shape().unwrap();
+    long.validate_with_market(&market.as_view()).unwrap();
+    short.validate_with_market(&market.as_view()).unwrap();
+}
+
+#[test]
 fn v16_sub_minimum_drain_only_adl_leg_refreshes_and_exits() {
     let (mut header, mut markets) = market_fixture(1, 100);
     let mut long_header = account_fixture(1, 231);
