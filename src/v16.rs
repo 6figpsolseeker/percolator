@@ -8479,7 +8479,28 @@ impl<'a, T> MarketGroupV16View<'a, T> {
             || asset.kf_epoch_short > asset.slot_last
             || asset.oi_eff_long_q > crate::MAX_OI_SIDE_Q
             || asset.oi_eff_short_q > crate::MAX_OI_SIDE_Q
-            || (mode == MarketModeV16::Live && asset.oi_eff_long_q != asset.oi_eff_short_q)
+            // The Live matched-book invariant (oi_eff_long == oi_eff_short) holds for
+            // a normally-trading asset (Active/DrainOnly always reduce matched pairs).
+            // A single asset can be in `Recovery` lifecycle inside a still-`Live`
+            // market: `force_asset_recovery` flips the asset to Recovery while the
+            // market mode stays Live, and the recovery teardown legitimately retires
+            // one side's `oi_eff` to 0 before the opposite side settles (the imbalance
+            // is bookkept by `pending_obligation_count`). Gate the symmetry conjunct on
+            // asset lifecycle, not market mode, so this intended transient asymmetry is
+            // not flagged. Empty lifecycles are symmetric at 0, so only Recovery needs
+            // the exemption; Active/DrainOnly enforcement is unchanged.
+            //
+            // Do NOT narrow this to `pending_obligation_count != 0`. That was tried
+            // (2026-09-14) and re-creates a false positive: a Recovery asset whose
+            // OPPOSITE side has already completed terminal wind-down holds a real
+            // position on one side and nothing on the other, with both obligation
+            // counts at 0 -- the very state `forfeit_recovery_leg_not_atomic`'s
+            // CommitRecovery arm exists for. Pinned by
+            // `v16_recovery_forfeit_commits_terminal_recovery_when_absorbing_side_is_empty`,
+            // whose fixture the narrower gate rejects before forfeit even runs.
+            || (mode == MarketModeV16::Live
+                && asset.lifecycle != AssetLifecycleV16::Recovery
+                && asset.oi_eff_long_q != asset.oi_eff_short_q)
             || asset.stale_account_count_long > asset.stored_pos_count_long
             || asset.stale_account_count_short > asset.stored_pos_count_short
             || asset.loss_weight_sum_long > SOCIAL_LOSS_DEN
@@ -24025,6 +24046,35 @@ mod attach_writer_cross_side_oi_tripwire_tests {
         assert!(
             matches!(audit_scan(asset), Err(V16Error::InvalidConfig)),
             "a one-atom cross-side divergence must be rejected in Live mode"
+        );
+    }
+
+    /// The matched-book symmetry conjunct is gated on asset lifecycle, not market
+    /// mode. A single asset in `Recovery` lifecycle inside a still-`Live` market is
+    /// transiently asymmetric by design during teardown (`force_asset_recovery`
+    /// flips the asset to Recovery while the market stays Live, and forfeit retires
+    /// one side's `oi_eff` before the opposite settles). This pins that exemption —
+    /// AND that it is scoped to Recovery only, so the Active-asset enforcement the
+    /// negative control above relies on is untouched.
+    #[test]
+    fn recovery_lifecycle_exempts_the_cross_side_oi_symmetry_requirement() {
+        // Same one-atom divergence the negative control rejects for an Active asset.
+        let mut asset = asset_with_asymmetric_a();
+        attach_one_fill(&mut asset);
+        asset.oi_eff_long_q += 1;
+
+        // Active: still rejected (the #457 defense the negative control guards).
+        assert_eq!(asset.lifecycle, AssetLifecycleV16::Active);
+        assert!(
+            matches!(audit_scan(asset), Err(V16Error::InvalidConfig)),
+            "an Active asset must still be held to the matched-book invariant"
+        );
+
+        // Recovery: the identical asymmetry is accepted (intended teardown state).
+        asset.lifecycle = AssetLifecycleV16::Recovery;
+        audit_scan(asset).expect(
+            "a Recovery-lifecycle asset is transiently asymmetric during teardown \
+             and must not be flagged by the Live matched-book conjunct",
         );
     }
 }
