@@ -17303,6 +17303,29 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         }))
     }
 
+    // F-02 regression PoC hook: exposes the outer per-account booking so a test can
+    // drive a multi-chunk close with a principal settlement interleaved between chunks
+    // and observe the residual actually booked. Gated to the same builds as the other
+    // proof/fuzz shims; absent from the wrapper/production build.
+    #[cfg(any(kani, feature = "fuzz"))]
+    pub fn kani_book_bankruptcy_residual_chunk_for_account_core(
+        &mut self,
+        account: &mut PortfolioV16ViewMut<'_>,
+        asset_index: usize,
+        bankrupt_side: SideV16,
+        residual_remaining: u128,
+    ) -> V16Result<(u128, u128)> {
+        let outcome = self.book_bankruptcy_residual_chunk_for_account_core(
+            account,
+            asset_index,
+            bankrupt_side,
+            residual_remaining,
+        )?;
+        // (booked_loss, explicit_loss) — their sum is the residual actually socialised
+        // by this chunk, which the F-02 regression compares against the fresh residual.
+        Ok((outcome.booked_loss, outcome.explicit_loss))
+    }
+
     #[cfg(kani)]
     pub fn kani_book_bankruptcy_residual_chunk_internal(
         &mut self,
@@ -17383,7 +17406,16 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         let outcome = self.book_bankruptcy_residual_chunk_internal(
             asset_index,
             bankrupt_side,
-            ledger.residual_remaining,
+            // F-02: book the FRESH residual (recomputed by the caller from the account's
+            // current pnl AFTER principal settlement and insurance), capped by the ledger's
+            // remaining. The raw captured `ledger.residual_remaining` is only lowered by
+            // booked loss, never by a mid-close principal settlement (owner deposit before a
+            // resolved close, or a liquidation between Live chunks), so booking it here
+            // over-socialised: the loss-bearing side and insurance were charged the
+            // pre-settlement residual while the account's own credit was clamped at the true
+            // loss. Taking the min never books more than either the current loss or the
+            // ledger's tracked remaining.
+            residual_remaining.min(ledger.residual_remaining),
         )?;
         self.advance_close_progress_ledger(
             account,
