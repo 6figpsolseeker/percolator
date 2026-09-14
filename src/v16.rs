@@ -19204,25 +19204,31 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
     //                                  single user controls, and whose over-lock window is
     //                                  bounded by max_bankrupt_close_lifetime_slots.
     //
-    //   explicit_unallocated_loss_*    the designated unallocatable-loss sink. HONEST
-    //                                  STATUS: this field has ZERO write sites in the
-    //                                  engine, so the row never fires — but calling it
-    //                                  "inert" would be wrong and was wrong in an earlier
-    //                                  revision of this comment. The engine DOES compute
-    //                                  unallocatable loss, as
-    //                                  `BResidualBookingOutcomeV16::explicit_loss`
-    //                                  (:12249/:12269/:12294), and then books it into the
+    //   explicit_unallocated_loss_*    NOT a term (removed, F-03). The realized
+    //                                  unallocatable-loss sink: whole atoms of social loss
+    //                                  that `kernel_normalize_social_loss_carry` could not
+    //                                  assign to any side's weight, saturating-added on a
+    //                                  leg clear (`kernel_clear_leg`) and cleared only at
+    //                                  retirement. (An earlier revision of this note said
+    //                                  the field had ZERO write sites; that is no longer
+    //                                  true.) It was a term here on the theory that it
+    //                                  flags unabsorbed loss — but it is a REALIZED
+    //                                  write-off, not pending loss (no crank or settlement
+    //                                  ever consumes it), so gating the group hlock on it
+    //                                  recreated the exact HOSTAGE this predicate was
+    //                                  narrowed to avoid: an ordinary close leaves a dust
+    //                                  atom that freezes LP/insurance withdrawals and
+    //                                  oracle reconfiguration group-wide, and for asset 0
+    //                                  (which RETIRE rejects) permanently. Its written
+    //                                  siblings social_loss_dust/remainder are, correctly,
+    //                                  already excluded for the same reason. The bankruptcy
+    //                                  path additionally books unallocatable loss into the
     //                                  per-ACCOUNT `close_progress.explicit_loss_assigned`
-    //                                  (:12114) where it counts as PROGRESS — finalizing
-    //                                  the ledger, dropping pending_domain_loss_barrier_*
-    //                                  and zeroing the bankrupt account's PnL, with no
-    //                                  asset-level record left behind. So on the one path
-    //                                  that produces the thing this row exists to catch,
-    //                                  the hlock clears in the same call sequence that
-    //                                  writes the loss off. The row is kept so the
-    //                                  predicate is already correct if the asset-level sink
-    //                                  is ever wired up; the gap itself is pre-existing and
-    //                                  is NOT closed here.
+    //                                  where it counts as PROGRESS. The write-off still
+    //                                  blocks slot reactivation/retire via
+    //                                  `asset_state_is_empty_for_activation`, so it is
+    //                                  recorded, not lost — only demoted from a group-freeze
+    //                                  signal to the residual-state signal it is.
     //
     // b_*/b_epoch_start_* (absorbed-loss bookkeeping, monotone) and social_loss_dust/
     // remainder (sub-atom quarantine sink that never drains) are intentionally excluded.
@@ -19267,10 +19273,22 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             // ONLY genuine unabsorbed-loss ledgers gate the hlock. Deliberately NOT the
             // side mode byte — see the note above the function for why that term was
             // dropped.
+            // F-03: `explicit_unallocated_loss_*` is a REALIZED write-off — whole atoms of
+            // social loss that `kernel_normalize_social_loss_carry` could not assign to any
+            // side's weight, saturating-added on a leg clear and cleared only at asset
+            // retirement. It is not pending, absorbable loss: no crank or settlement will
+            // ever consume it. Gating the group-wide hlock on it recreated exactly the
+            // HOSTAGE this predicate was narrowed to avoid (see the note above) — an ordinary
+            // close leaves a dust atom that latches LP/insurance withdrawals and oracle
+            // reconfiguration for EVERY domain in the group, and for asset 0 (which RETIRE
+            // rejects) the latch is permanent. Its written siblings `social_loss_dust_*` /
+            // `social_loss_remainder_*` were already, correctly, not gated here for the same
+            // reason. `pending_domain_loss_barrier_*` remains: it IS genuine loss awaiting
+            // domain absorption. The write-off still blocks slot reactivation/retire through
+            // `asset_state_is_empty_for_activation`, so it is not lost — only demoted from a
+            // group-freeze signal to the residual-state signal it actually is.
             if slot.pending_domain_loss_barrier_long.get() != 0
                 || slot.pending_domain_loss_barrier_short.get() != 0
-                || slot.asset.explicit_unallocated_loss_long.get() != 0
-                || slot.asset.explicit_unallocated_loss_short.get() != 0
             {
                 return true;
             }
@@ -23589,6 +23607,50 @@ mod bankruptcy_hlock_clear_predicate_tests {
         assert_eq!(
             market.header.bankruptcy_hlock_active, 1,
             "hlock must stay engaged while a close ledger still has residual"
+        );
+    }
+
+    // F-03 regression: a REALIZED unallocatable write-off atom must NOT gate the group
+    // hlock. In production `kernel_clear_leg` -> `kernel_normalize_social_loss_carry`
+    // saturating-adds a whole SOCIAL_LOSS_DEN atom into `explicit_unallocated_loss_*` when a
+    // leg clear's `b_rem` crosses an atom with no side weight left to absorb it. That atom
+    // is cleared only at asset retirement, and RETIRE rejects asset 0 -- so gating the
+    // group-wide hlock on it froze LP/insurance withdrawals and oracle reconfiguration for
+    // EVERY domain, permanently. Here the only residual is that write-off (no domain-loss
+    // barrier, every header counter zero), so the hlock must clear.
+    #[test]
+    fn an_unallocatable_write_off_atom_does_not_latch_the_hlock() {
+        let (mut header, mut markets) = one_asset_market_fixture();
+        // The whole-atom dust a leg clear leaves behind (kernel_normalize_social_loss_carry).
+        markets[0].engine.asset.explicit_unallocated_loss_long = V16PodU128::new(1);
+        header.bankruptcy_hlock_active = 1;
+
+        let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+
+        // No genuine pending loss: no domain-loss barrier on either side.
+        assert_eq!(
+            market.markets[0].engine.pending_domain_loss_barrier_long.get(),
+            0
+        );
+        assert_eq!(
+            market.markets[0].engine.pending_domain_loss_barrier_short.get(),
+            0
+        );
+
+        assert!(
+            !market.group_has_unabsorbed_bankruptcy_loss(),
+            "a realized unallocatable write-off must not count as unabsorbed bankruptcy loss (F-03)"
+        );
+        market.try_clear_bankruptcy_hlock_if_healthy().unwrap();
+        assert_eq!(
+            market.header.bankruptcy_hlock_active, 0,
+            "hlock must clear once the only residual is an unallocatable write-off atom (F-03)"
+        );
+
+        // The write-off is still recorded as residual state: the slot is not reusable.
+        assert!(
+            market.asset_local_has_position_or_loss_state(0).unwrap(),
+            "the write-off stays recorded (still blocks slot reactivation), only demoted from a group freeze"
         );
     }
 
