@@ -20786,6 +20786,34 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         amount: u128,
     ) -> V16Result<()> {
         account.validate_with_market(&self.as_view())?;
+        // ── GH#448 / spec.md §1204: deposit is LIVE-ONLY ────────────────────────
+        //
+        // "`deposit(i, amount, now_slot)` is live-only, no-accrual, and may
+        // materialize missing `i` only if `amount > 0`."
+        //
+        // This function had NO mode check — only `validate_with_market`, which
+        // accepts an account with an active close ledger and negative pnl. #448
+        // showed what that permits: during a multi-chunk RESOLVED-mode bankruptcy
+        // close, a mid-close deposit lets principal settlement drive `pnl` back to
+        // >= 0 WITHOUT advancing the close ledger. The ledger stays active and
+        // non-finalized with `residual_remaining > 0`, the domain-loss barrier is
+        // held forever, and `cure_and_cancel_close` refuses to help because a chunk
+        // was already booked. That bricks the (asset, side) domain permanently.
+        //
+        // PRODUCTION WAS NEVER EXPOSED, and it is worth being exact about why
+        // rather than implying a live fund bug: the wrapper's `handle_deposit`
+        // already rejects any market whose mode is not Live, and
+        // `close_resolved_account_not_atomic` requires Resolved. A market is one or
+        // the other, so the two windows cannot overlap through the deployed
+        // program. #448's PoC reaches it by calling this function directly.
+        //
+        // The gate belongs here anyway. Relying on the wrapper makes a spec
+        // invariant depend on one caller remembering it, and the engine is the
+        // layer the spec constrains — a second wrapper path calling this without a
+        // mode check would silently reopen the whole thing.
+        if decode_market_mode(self.header.mode)? != MarketModeV16::Live {
+            return Err(V16Error::LockActive);
+        }
         if amount == 0 {
             return Ok(());
         }
