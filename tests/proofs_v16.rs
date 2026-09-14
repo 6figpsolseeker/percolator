@@ -14463,7 +14463,7 @@ fn proof_v16_withdraw_insurance_surplus_conserves_vault_insurance_lockstep() {
 #[kani::proof]
 #[kani::unwind(32)]
 #[kani::solver(cadical)]
-fn proof_v16_taker_only_charges_exactly_one_side() {
+fn proof_v16_taker_only_never_overcharges_and_maker_pays_only_shortfall() {
     let taker_is_long_account: bool = kani::any();
     let long_capital_raw: u8 = kani::any();
     let short_capital_raw: u8 = kani::any();
@@ -14592,11 +14592,60 @@ fn proof_v16_taker_only_charges_exactly_one_side() {
         "fix: N1 fallback fires on capital-exhaustion alone (short taker, pnl>=0, capital==0) -- solvent long maker charged"
     );
 
-    // Mutual exclusivity: taker-only charging never collects from both
-    // sides on the same fill (this is the formal "taker-only" statement).
+    // ── GH#133 REPLACED the mutual-exclusivity obligation ────────────────────
+    //
+    // This used to assert `fee_a == 0 || fee_b == 0` and called that "the formal
+    // taker-only statement". GH#133's fix makes it false, deliberately, so the
+    // obligation is replaced rather than deleted — and it is worth being precise
+    // about what was actually lost, because the assertion overstated the property
+    // it was guarding.
+    //
+    // Mutual exclusivity was never the user-facing promise. The N1 fallback
+    // ALREADY charged the maker the full fee whenever the taker paid nothing, so
+    // a maker could always end up paying; exclusivity only said the two never
+    // happened on the same fill. That was an artifact of the fallback being
+    // all-or-nothing, not a guarantee anyone relied on.
+    //
+    // What the promise actually is: the maker is not touched while the taker can
+    // pay, and the protocol never collects more than the fee. Both are asserted
+    // below, and together they are STRICTER than exclusivity was — exclusivity
+    // permitted charging the maker the FULL fee after the taker had already paid
+    // part of it, which is precisely the over-collection the shortfall fix has to
+    // avoid.
+    //
+    // 1. NEVER OVER-COLLECT. The two charges together cannot exceed the fee.
     assert!(
-        fee_a == 0 || fee_b == 0,
-        "both sides charged simultaneously -- taker-only violated"
+        fee_a.saturating_add(fee_b) <= fee,
+        "collected more than the fee -- over-collection"
+    );
+
+    // 2. THE MAKER IS ONLY EVER ASKED FOR A SHORTFALL. If the maker paid
+    //    anything, the taker must have paid strictly less than the full fee.
+    //    This is the real "taker-only" content: a maker with a fully-paying
+    //    counterparty is never charged.
+    let (taker_paid, maker_paid) = if taker_is_long_account {
+        (fee_a, fee_b)
+    } else {
+        (fee_b, fee_a)
+    };
+    if maker_paid > 0 {
+        assert!(
+            taker_paid < fee,
+            "maker charged while the taker paid in full -- taker-only violated"
+        );
+    }
+
+    // 3. AND THE SHORTFALL IS THE CEILING ON THE MAKER'S SHARE.
+    assert!(
+        maker_paid <= fee.saturating_sub(taker_paid),
+        "maker charged more than the taker's shortfall"
+    );
+
+    kani::cover!(
+        taker_paid > 0 && maker_paid > 0,
+        "GH#133: a partially-paying taker and a maker covering the remainder -- \
+         the state the old exclusivity assertion forbade and the old trigger \
+         silently left uncollected"
     );
 
     // N1 no-evasion obligation (WIDENED 2026-07-15 alongside the fix): a
@@ -14649,7 +14698,8 @@ fn proof_v16_taker_only_conserves_notional_unaffected() {
     // harness -- confirmed by mutation, a pnl-corrupting mutation inside the
     // fallback arm went uncaught (0/3249 checks failed). Mirrors the nondet
     // pnl bools already used by the sibling harness
-    // `proof_v16_taker_only_charges_exactly_one_side` -- sign is the only
+    // `proof_v16_taker_only_never_overcharges_and_maker_pays_only_shortfall`
+    // -- sign is the only
     // thing the waiver reads, so `-1` is a fully general representative of
     // "negative" (no narrowing of the adversarial space).
     let long_pnl_neg: bool = kani::any();
