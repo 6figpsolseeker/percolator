@@ -21131,16 +21131,50 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         )
     }
 
+    /// Dead-leg forfeit/detach is a TERMINAL-asset exit, never a live-market one.
+    ///
+    /// Spec: requirement 30 (`av spec.md:65`) — "public markets MUST expose bounded
+    /// owner-callable dead-leg forfeit/detach for *terminal/recovery* assets" — restated at
+    /// `av spec.md:1580` ("bounded and owner-callable for terminal/recovery/dead assets"). Both
+    /// exits of `forfeit_recovery_leg_not_atomic` remove ONE side's `oi_eff` with no paired
+    /// opposite-side reduction: the clean-detach arm calls `clear_leg` (`kernel_clear_leg`
+    /// subtracts `oi_eff_<side>` and `loss_weight_sum_<side>` alone), and the retention arm calls
+    /// `kernel_retain_leg_as_pending_obligation`, whose upstream contract pins the opposite side
+    /// as byte-unchanged. So admitting the exit on an asset that is still trading ends the
+    /// instruction with `oi_eff_long != oi_eff_short` on a Live market — forbidden by
+    /// `av spec.md:952` ("if Live: OI_eff_long == OI_eff_short", stated for every
+    /// Active/DrainOnly/Recovery asset side) and skipping `spec.md:1239` (§8.1 step 9, "assert OI
+    /// symmetry for side-mutating/live-exposure instructions", with `:1242` foreclosing the
+    /// early-return defence). `validate_asset_shape_for_view` says the same in code: its
+    /// matched-book conjunct exempts `lifecycle == Recovery` only, on the stated rationale that
+    /// "Active/DrainOnly enforcement is unchanged".
+    ///
+    /// The SIDE MODE is not the ASSET LIFECYCLE. `reduce_matching_open_interest_for_unilateral_close`
+    /// latches `mode_<side> = DrainOnly` whenever a single unilateral close drives the opposite
+    /// side's `A` factor under `MIN_A_SIDE`, and it touches no lifecycle. Before this gate the
+    /// third disjunct read `side_mode` alone, so one owner-signed unilateral close opened the
+    /// terminal exit on a fully Active/Live asset and left the book one-sided; every surviving
+    /// counterparty then read `unilateral_close_capacity = min(.., 0, ..) = 0` and could neither
+    /// reduce nor be liquidated, and `accrual_activity_for_asset_segment`'s `balanced_exposure`
+    /// switched funding off for the whole asset. Gate the side-mode disjunct on the asset
+    /// lifecycle so it only admits the terminal states the spec names.
+    ///
+    /// `AssetLifecycleV16::Recovery` still admits unconditionally through the second disjunct
+    /// (the owner exit a recovering asset relies on), and market-wide `MarketModeV16::Recovery`
+    /// through the first; the third disjunct now adds only `Retired`, the terminal lifecycle.
     fn leg_is_dead_for_forfeit(&self, asset_index: usize, side: SideV16) -> V16Result<bool> {
         let side_mode = self.side_mode_for(asset_index, side)?;
         let asset_lifecycle = self.asset_state(asset_index)?.lifecycle;
         Ok(
             decode_market_mode(self.header.mode)? == MarketModeV16::Recovery
                 || asset_lifecycle == AssetLifecycleV16::Recovery
-                || matches!(
+                || (matches!(
                     side_mode,
                     SideModeV16::DrainOnly | SideModeV16::ResetPending
-                ),
+                ) && matches!(
+                    asset_lifecycle,
+                    AssetLifecycleV16::Recovery | AssetLifecycleV16::Retired
+                )),
         )
     }
 
