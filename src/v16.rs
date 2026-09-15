@@ -5180,7 +5180,14 @@ impl<'a> PortfolioV16View<'a> {
         if source_claim_sum_num != 0 {
             let source_attributed_pnl =
                 if decode_market_mode(market.header.mode)? == MarketModeV16::Resolved {
-                    pnl.max(0) as u128 - self.header.reserved_pnl.get()
+                    // Guarded ~13 lines above, but keep the guard local to the use:
+                    // a wrapped value here does not make
+                    // `validate_positive_pnl_source_attribution` wrong, it makes it
+                    // disappear (`u128::MAX as i128 == -1` hits its `pnl <= 0` early
+                    // return), silently dropping the source-domain realizability cap.
+                    (pnl.max(0) as u128)
+                        .checked_sub(self.header.reserved_pnl.get())
+                        .ok_or(V16Error::CounterUnderflow)?
                 } else {
                     pnl.max(0) as u128
                 };
@@ -9611,6 +9618,24 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
                     next_asset_index: scan_end,
                 });
             }
+        }
+
+        // The scan above only covers `[scan_start_asset_index, scan_end)`, so any
+        // asset BELOW the continuation cursor is never inspected on this call. The
+        // direct entry `retire_terminal_unbudgeted_insurance_not_atomic` refuses
+        // retirement while any asset still owes a claim-free provider recredit; the
+        // crank fall-through must not be weaker, or `ReadyToClose` burns the owed
+        // atoms (vault -> 0 with `insurance_domain_spent_*` and
+        // `provider_receivable_num` still nonzero, and `validate_shape` silent).
+        //
+        // Rewinding via `ScanProgress` rather than failing with `LockActive` keeps
+        // the wrapper's persisted-cursor protocol live: a hard error would leave
+        // `terminal_slab_scan_progress` pinned above the skipped asset and dead-end
+        // the close sequence forever. The returned index is strictly below the
+        // cursor (anything at or above it was just inspected), so the next call
+        // recredits it and the scan makes progress.
+        if let Some(next_asset_index) = self.first_terminal_claim_free_recredit_asset()? {
+            return Ok(TerminalSlabOutcomeV16::ScanProgress { next_asset_index });
         }
 
         if self.header.backing_provider_earnings_total.get() != 0
