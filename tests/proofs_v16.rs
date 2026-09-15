@@ -6528,10 +6528,13 @@ fn proof_v16_counterparty_backing_withdraw_delta_debits_only_unliened_backing() 
         ..SourceCreditStateV16::EMPTY
     };
 
+    // C-S-10b: the bucket is UNEXPIRED at slot 0 (`expiry_slot == 10`), which is
+    // the only state the withdraw gate admits.
     let (bucket_after, source_after) =
         MarketGroupV16ViewMut::<u64>::kani_prepare_counterparty_backing_withdraw_delta(
             bucket,
             source,
+            0,
             withdraw_num,
         )
         .unwrap();
@@ -6573,6 +6576,11 @@ fn proof_v16_counterparty_backing_withdraw_delta_status_transitions_are_exact() 
     let impaired_raw: u8 = kani::any();
     let status_raw: u8 = kani::any();
     let source_short: bool = kani::any();
+    // C-S-10b: the observation slot is symbolic around the bucket's
+    // `expiry_slot == 10`, so both the live and the LAPSED case are in scope.
+    let current_slot_raw: u8 = kani::any();
+    kani::assume(current_slot_raw <= 20);
+    let current_slot = current_slot_raw as u64;
     kani::assume(amount_raw <= 8);
     kani::assume(fresh_raw <= 8);
     kani::assume(valid_raw <= 8);
@@ -6617,10 +6625,15 @@ fn proof_v16_counterparty_backing_withdraw_delta_status_transitions_are_exact() 
     };
 
     let result = MarketGroupV16ViewMut::<u64>::kani_prepare_counterparty_backing_withdraw_delta(
-        bucket, source, amount,
+        bucket,
+        source,
+        current_slot,
+        amount,
     );
+    let lapsed = bucket.expiry_slot <= current_slot;
     let expected_ok = amount == 0
         || (status == BackingBucketStatusV16::Fresh
+            && !lapsed
             && fresh >= amount
             && source_fresh_reserved >= amount);
 
@@ -6632,13 +6645,23 @@ fn proof_v16_counterparty_backing_withdraw_delta_status_transitions_are_exact() 
         amount > 0 && status != BackingBucketStatusV16::Fresh,
         "counterparty backing withdraw rejects non-Fresh buckets"
     );
+    // C-S-10b: the lapsed-but-still-`Fresh` bucket is the state the old gate paid out.
     kani::cover!(
-        amount > 0 && status == BackingBucketStatusV16::Fresh && fresh < amount,
+        amount > 0
+            && status == BackingBucketStatusV16::Fresh
+            && lapsed
+            && fresh >= amount
+            && source_fresh_reserved >= amount,
+        "counterparty backing withdraw rejects a LAPSED Fresh bucket that is otherwise fundable"
+    );
+    kani::cover!(
+        amount > 0 && status == BackingBucketStatusV16::Fresh && !lapsed && fresh < amount,
         "counterparty backing withdraw rejects insufficient bucket backing"
     );
     kani::cover!(
         amount > 0
             && status == BackingBucketStatusV16::Fresh
+            && !lapsed
             && fresh >= amount
             && source_fresh_reserved < amount,
         "counterparty backing withdraw rejects insufficient source backing"
@@ -6729,6 +6752,7 @@ fn proof_v16_counterparty_backing_withdraw_cannot_underback_claims() {
         MarketGroupV16ViewMut::<u64>::kani_prepare_counterparty_backing_withdraw_delta(
             bucket,
             source,
+            0,
             withdraw_num,
         )
         .unwrap();

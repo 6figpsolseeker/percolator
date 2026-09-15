@@ -2881,15 +2881,27 @@ impl V16Core {
         Ok((bucket, source))
     }
 
+    /// C-S-10b: the `Fresh` status test alone is NOT freshness. A bucket keeps
+    /// `status == Fresh` after `expiry_slot` until something runs the expiry
+    /// transition, and on that lapsed bucket the provider used to withdraw
+    /// principal the expiry rule forfeits to the junior pool
+    /// (`prepare_counterparty_backing_expiry_delta`), while the entry above it
+    /// reads `credit_rate_num` on that same bucket — the inflation
+    /// `spec.md:342-357` forbids. Both siblings already test the lapse:
+    /// `prepare_counterparty_lien_create_delta` and
+    /// `prepare_counterparty_lien_release_delta` refuse on
+    /// `expiry_slot <= current_slot`. The gate below mirrors them.
     fn prepare_counterparty_backing_withdraw_delta(
         mut bucket: BackingBucketV16,
         mut source: SourceCreditStateV16,
+        current_slot: u64,
         amount: u128,
     ) -> V16Result<(BackingBucketV16, SourceCreditStateV16)> {
         if amount == 0 {
             return Ok((bucket, source));
         }
         if bucket.status != BackingBucketStatusV16::Fresh
+            || bucket.expiry_slot <= current_slot
             || bucket.fresh_unliened_backing_num < amount
             || source.fresh_reserved_backing_num < amount
         {
@@ -9232,6 +9244,7 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         let (bucket, source) = V16Core::prepare_counterparty_backing_withdraw_delta(
             self.backing_bucket_for_domain(domain)?,
             self.source_credit_for_domain(domain)?,
+            self.header.current_slot.get(),
             backing_num,
         )?;
         let (source, next_risk_epoch) = V16Core::prepare_source_credit_domain_recompute_for_epoch(
@@ -10800,8 +10813,32 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         )?;
 
         if counterparty_backing_release != 0 {
-            // Unwinding returns already-liened principal; it does not extend new
-            // credit, so expiry must not block a loss from being recognized.
+            // C-S-20: canonicalize a LAPSED `Fresh` bucket before the release.
+            // Unwinding returns already-liened principal and does not extend new
+            // credit, so expiry must not BLOCK a loss from being recognized — but
+            // it must not be SKIPPED either. spec.md:562 ("if a counterparty
+            // backing bucket expires ... the lien becomes `Impaired`") and the
+            // expiry rule at spec.md:342-357 ("liened backing in an expiring
+            // bucket MUST NOT cause `available_backing_num` underflow or
+            // inflation ... on expiry the engine MUST [refresh | atomically
+            // expire | route to recovery] before any credit-rate read") make the
+            // lapsed case a forfeit to the junior pool, not an un-pledge back to
+            // the provider. Without this, the expiry-agnostic terminal kernel
+            // (:2869, scoped by its own doc comment to Resolved wind-down) moves
+            // `valid_liened -> fresh_unliened` in LIVE mode, `:9148`'s withdraw
+            // gate then pays the lapsed principal out (wrapper tag 50), and the
+            // junior residual pool loses it atom for atom.
+            //
+            // Expiry moves the liened principal into the impaired counters; the
+            // release below then clears exactly those counters through the LIEN-1
+            // impaired arm (:2877-2898) WITHOUT re-crediting fresh backing, so the
+            // loss still settles and the burn stays live. Same shape as the Live
+            // retirement sibling at :19782-19794.
+            let now = self.header.current_slot.get();
+            let bucket = self.backing_bucket_for_domain(domain)?;
+            if bucket.status == BackingBucketStatusV16::Fresh && bucket.expiry_slot <= now {
+                self.expire_source_backing_bucket_not_atomic(domain, now)?;
+            }
             self.release_source_credit_lien_from_counterparty_terminal_not_atomic(
                 domain,
                 counterparty_backing_release,
@@ -12341,9 +12378,10 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
     pub fn kani_prepare_counterparty_backing_withdraw_delta(
         bucket: BackingBucketV16,
         source: SourceCreditStateV16,
+        current_slot: u64,
         amount: u128,
     ) -> V16Result<(BackingBucketV16, SourceCreditStateV16)> {
-        V16Core::prepare_counterparty_backing_withdraw_delta(bucket, source, amount)
+        V16Core::prepare_counterparty_backing_withdraw_delta(bucket, source, current_slot, amount)
     }
 
     #[cfg(kani)]
@@ -20645,15 +20683,24 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             }
             if bucket.status == BackingBucketStatusV16::Fresh && bucket.expiry_slot <= current_slot
             {
-                if source.source_claim_liened_num.get() != 0 {
-                    // This fork's release takes the #146 terminal flag; the
-                    // Resolved wind-down is exactly upstream's unflagged body.
-                    self.release_account_source_credit_lien_for_domain_not_atomic(
-                        account, domain, true,
-                    )?;
-                } else {
-                    self.expire_source_backing_bucket_not_atomic(domain, current_slot)?;
-                }
+                // C-S-20b: a LAPSED `Fresh` bucket takes the canonical expiry
+                // rule, whether or not this account still holds a lien on it.
+                // The liened branch used to select the lapsed bucket straight
+                // into the expiry-agnostic terminal release, which un-pledges
+                // `valid_liened -> fresh_unliened` and leaves the bucket `Fresh`
+                // — the Resolved twin of C-S-20. That contradicts spec.md:562
+                // (an expired counterparty bucket makes the lien `Impaired`) and
+                // the no-inflation MUST at spec.md:342-357, and it makes the
+                // crank ORDER decide the stock class: closing an UNLIENED
+                // co-tenant first took the `else` arm and forfeited the same
+                // atoms to the junior pool.
+                //
+                // Expiry moves this account's share to the impaired counters;
+                // the account's next preparation step then takes the Impaired
+                // arm above (`:20424-20440`), which crystallizes the utilization
+                // fee, retires the market-side impaired counters and relabels
+                // the claim — so the close still progresses.
+                self.expire_source_backing_bucket_not_atomic(domain, current_slot)?;
                 account.compact_source_domains();
                 account.header.health_cert.valid = 0;
                 self.validate_shape()?;
