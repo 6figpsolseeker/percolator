@@ -10698,8 +10698,32 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         )?;
 
         if counterparty_backing_release != 0 {
-            // Unwinding returns already-liened principal; it does not extend new
-            // credit, so expiry must not block a loss from being recognized.
+            // C-S-20: canonicalize a LAPSED `Fresh` bucket before the release.
+            // Unwinding returns already-liened principal and does not extend new
+            // credit, so expiry must not BLOCK a loss from being recognized — but
+            // it must not be SKIPPED either. spec.md:562 ("if a counterparty
+            // backing bucket expires ... the lien becomes `Impaired`") and the
+            // expiry rule at spec.md:342-357 ("liened backing in an expiring
+            // bucket MUST NOT cause `available_backing_num` underflow or
+            // inflation ... on expiry the engine MUST [refresh | atomically
+            // expire | route to recovery] before any credit-rate read") make the
+            // lapsed case a forfeit to the junior pool, not an un-pledge back to
+            // the provider. Without this, the expiry-agnostic terminal kernel
+            // (:2869, scoped by its own doc comment to Resolved wind-down) moves
+            // `valid_liened -> fresh_unliened` in LIVE mode, `:9148`'s withdraw
+            // gate then pays the lapsed principal out (wrapper tag 50), and the
+            // junior residual pool loses it atom for atom.
+            //
+            // Expiry moves the liened principal into the impaired counters; the
+            // release below then clears exactly those counters through the LIEN-1
+            // impaired arm (:2877-2898) WITHOUT re-crediting fresh backing, so the
+            // loss still settles and the burn stays live. Same shape as the Live
+            // retirement sibling at :19782-19794.
+            let now = self.header.current_slot.get();
+            let bucket = self.backing_bucket_for_domain(domain)?;
+            if bucket.status == BackingBucketStatusV16::Fresh && bucket.expiry_slot <= now {
+                self.expire_source_backing_bucket_not_atomic(domain, now)?;
+            }
             self.release_source_credit_lien_from_counterparty_terminal_not_atomic(
                 domain,
                 counterparty_backing_release,
