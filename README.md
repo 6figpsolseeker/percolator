@@ -225,16 +225,16 @@ price diverge.
 
 ```bash
 # Default suite
-cargo test                          # 312 tests, 0 failures
+cargo test                          # 344 tests, 0 failures (all targets, main a90fb27f + this stack)
 
 # With the fuzz/property targets (v16_fuzzing is `required-features = ["fuzz"]`)
-cargo test --features fuzz          # 365 tests, 0 failures
+cargo test --features fuzz          # 398 tests, 0 failures
 
 # With the O(N) account-table invariant scans. This feature is the ONLY build in which
 # validate_shape_full_audit_scan / validate_asset_shape_for_view compile in at all, so the
 # default suite being green says nothing about them. CI runs these two as the `audit-scan` job.
 cargo test --features audit-scan --test v16_spec_tests   # 179 tests, 0 failures
-cargo test --features audit-scan --lib                   # 67 tests, 0 failures
+cargo test --features audit-scan --lib                   # 68 tests, 0 failures
 ```
 
 `v16_spec_tests` runs 179 under `audit-scan` and 180 by default: exactly one test is
@@ -242,11 +242,15 @@ cargo test --features audit-scan --lib                   # 67 tests, 0 failures
 Live matched-book invariant — see the comment above
 `v16_auto_crank_does_not_liquidate_against_unmatched_effective_oi`.
 
-The `audit-scan` job is deliberately scoped to those two targets. `cargo test --features
-audit-scan` across ALL targets is **not** green today: `tests/grief_econ_final.rs` is 5/2, and
-both failures (`:146`, `:208`) are the same hand-written-fixture shape the spec suite's seven
-had — `Err(InvalidConfig)` from `validate_shape()` on state a helper assigned directly, never
-produced by an engine instruction. That is untriaged, so it is not in the gate yet.
+The `audit-scan` CI job runs `cargo test --features audit-scan --no-fail-fast --all-targets`
+and is green across every target (343 tests, 0 failures at this stack's tip). It was briefly
+scoped to two targets while `tests/grief_econ_final.rs` (5/2) and `tests/f03_regression.rs`
+(3/1) carried the same hand-written-fixture shape the spec suite's seven had —
+`Err(InvalidConfig)` from `validate_shape()` on state a helper assigned directly, never
+produced by an engine instruction. Both fixtures were put back on-model (AS-03, AS-05) and the
+job was widened. Seven of the twenty targets contribute zero tests under `audit-scan` (two
+need `fuzz`, one needs `fork-facade`, four are Kani-only proof files) — a `running 0 tests`
+line there is expected, not a pass.
 
 There is no `test` feature; the declared features are `stress`, `fuzz`, `audit-scan` and
 `fork-facade` (`Cargo.toml`), with `default = []`.
