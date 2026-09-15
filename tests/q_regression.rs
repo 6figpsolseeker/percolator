@@ -20,13 +20,12 @@
 //! `signed_q` verbatim).
 
 use percolator::{
-    AssetStateV16Account, AutoCrankOutcomeV16, AutoCrankPlanV16, AutoCrankResultV16,
-    AutoCrankWorkV16, BackingBucketStatusV16, EngineAssetSlotV16Account, Market,
-    MarketGroupV16HeaderAccount, MarketGroupV16ViewMut, PermissionlessProgressOutcomeV16,
+    v16_domain_count_for_market_slots, AssetStateV16Account, AutoCrankOutcomeV16, AutoCrankPlanV16,
+    AutoCrankResultV16, AutoCrankWorkV16, BackingBucketStatusV16, EngineAssetSlotV16Account,
+    Market, MarketGroupV16HeaderAccount, MarketGroupV16ViewMut, PermissionlessProgressOutcomeV16,
     PortfolioAccountV16Account, PortfolioV16ViewMut, ProvenanceHeaderV16,
     ProvenanceHeaderV16Account, ResolvedCloseOutcomeV16, TradeRequestV16, V16Config, V16Error,
     V16PodU64,
-    v16_domain_count_for_market_slots,
 };
 use percolator::{BOUND_SCALE, POS_SCALE};
 
@@ -315,9 +314,18 @@ fn q_live_burn_on_lapsed_bucket_forfeits_principal_instead_of_returning_it() {
     let src_fresh_after = market.header.source_fresh_backing_total_num.get();
     println!("[Q-live lapsed] chunk.loss                   = {loss}");
     println!("[Q-live lapsed] lien on the lapsed bucket    = {released}");
-    println!("[Q-live lapsed] bucket.status                = {:?}", after.status);
-    println!("[Q-live lapsed] valid_liened    {} -> {}", before.valid, after.valid);
-    println!("[Q-live lapsed] fresh_unliened  {} -> {}", before.fresh, after.fresh);
+    println!(
+        "[Q-live lapsed] bucket.status                = {:?}",
+        after.status
+    );
+    println!(
+        "[Q-live lapsed] valid_liened    {} -> {}",
+        before.valid, after.valid
+    );
+    println!(
+        "[Q-live lapsed] fresh_unliened  {} -> {}",
+        before.fresh, after.fresh
+    );
     println!(
         "[Q-live lapsed] impaired_liened {} -> {}",
         before.impaired, after.impaired
@@ -351,16 +359,19 @@ fn q_live_burn_on_lapsed_bucket_forfeits_principal_instead_of_returning_it() {
     );
 
     // the money leg: wrapper tag 50 is refused on the forfeited principal.
-    let w = market.withdraw_fresh_counterparty_backing_not_atomic(CP_DOMAIN, released / BOUND_SCALE);
+    let w =
+        market.withdraw_fresh_counterparty_backing_not_atomic(CP_DOMAIN, released / BOUND_SCALE);
     println!("[Q-live lapsed] tag50 withdraw(released) -> {w:?}");
     assert!(
         w.is_err(),
         "FIXED: the provider cannot withdraw the forfeited principal: {w:?}"
     );
-    let w_all = market
-        .withdraw_fresh_counterparty_backing_not_atomic(CP_DOMAIN, BACKING_PRINCIPAL);
+    let w_all = market.withdraw_fresh_counterparty_backing_not_atomic(CP_DOMAIN, BACKING_PRINCIPAL);
     println!("[Q-live lapsed] tag50 withdraw(whole principal) -> {w_all:?}");
-    assert!(w_all.is_err(), "nothing in the lapsed bucket is withdrawable");
+    assert!(
+        w_all.is_err(),
+        "nothing in the lapsed bucket is withdrawable"
+    );
 }
 
 /// The two crank orderings now CONVERGE: burn-first (the defect ordering) ends
@@ -439,10 +450,22 @@ fn q_live_burn_on_unexpired_bucket_still_returns_principal_to_provider() {
     let after = bucket_of(&market);
     let src_fresh_after = market.header.source_fresh_backing_total_num.get();
     println!("[Q-live unexpired] chunk.loss = {loss}, lien = {released}");
-    println!("[Q-live unexpired] status {:?} -> {:?}", before.status, after.status);
-    println!("[Q-live unexpired] valid   {} -> {}", before.valid, after.valid);
-    println!("[Q-live unexpired] fresh   {} -> {}", before.fresh, after.fresh);
-    println!("[Q-live unexpired] impaired {} -> {}", before.impaired, after.impaired);
+    println!(
+        "[Q-live unexpired] status {:?} -> {:?}",
+        before.status, after.status
+    );
+    println!(
+        "[Q-live unexpired] valid   {} -> {}",
+        before.valid, after.valid
+    );
+    println!(
+        "[Q-live unexpired] fresh   {} -> {}",
+        before.fresh, after.fresh
+    );
+    println!(
+        "[Q-live unexpired] impaired {} -> {}",
+        before.impaired, after.impaired
+    );
 
     assert_eq!(after.valid, 0);
     assert_eq!(
@@ -450,13 +473,17 @@ fn q_live_burn_on_unexpired_bucket_still_returns_principal_to_provider() {
         before.fresh + released,
         "LIVENESS: an unexpired bucket still un-pledges valid_liened -> fresh_unliened"
     );
-    assert_eq!(after.impaired, 0, "nothing is forfeited on an unexpired bucket");
+    assert_eq!(
+        after.impaired, 0,
+        "nothing is forfeited on an unexpired bucket"
+    );
     assert_eq!(after.status, BackingBucketStatusV16::Fresh);
     assert_eq!(
         src_fresh_after, src_fresh_before,
         "the senior term is value-neutral for an unexpired release"
     );
-    let w = market.withdraw_fresh_counterparty_backing_not_atomic(CP_DOMAIN, released / BOUND_SCALE);
+    let w =
+        market.withdraw_fresh_counterparty_backing_not_atomic(CP_DOMAIN, released / BOUND_SCALE);
     println!("[Q-live unexpired] tag50 withdraw(released) -> {w:?}");
     w.expect("LIVENESS: an unexpired bucket's unliened principal is still withdrawable");
 }
@@ -590,7 +617,11 @@ fn resolved_lapsed_fixture() -> ResolvedFixture {
         assert!(liened_backing_num > 0, "counterparty-backed lien expected");
         let co = trigger.header.source_domains[0];
         assert_eq!(co.domain.get() as usize, CP_DOMAIN);
-        assert_eq!(co.source_claim_liened_num.get(), 0, "co-tenant must be unliened");
+        assert_eq!(
+            co.source_claim_liened_num.get(),
+            0,
+            "co-tenant must be unliened"
+        );
 
         for slot in 3..=RESOLVE_SLOT {
             market
@@ -709,7 +740,10 @@ fn q_resolved_close_on_lapsed_bucket_forfeits_instead_of_un_pledging() {
         pre.src_fresh_total, step1.src_fresh_total, pre.residual, step1.residual
     );
 
-    assert_eq!(step1.bucket.valid, 0, "the lien is off the bucket either way");
+    assert_eq!(
+        step1.bucket.valid, 0,
+        "the lien is off the bucket either way"
+    );
     assert_eq!(
         step1.bucket.impaired, lien,
         "FIXED: the expiry rule moves the liened principal valid_liened -> IMPAIRED"
@@ -794,13 +828,25 @@ fn q_resolved_crank_order_no_longer_decides_the_stock_class() {
     let (b1, b_fin, b_out) = run("B winner-first", 1);
     let (c1, c_fin, c_out) = run("C co-tenant-first", 2);
 
-    assert_eq!(a1.bucket, b1.bucket, "A and B agree on the bucket after step 1");
-    assert_eq!(a1.bucket, c1.bucket, "A and C agree on the bucket after step 1");
+    assert_eq!(
+        a1.bucket, b1.bucket,
+        "A and B agree on the bucket after step 1"
+    );
+    assert_eq!(
+        a1.bucket, c1.bucket,
+        "A and C agree on the bucket after step 1"
+    );
     assert_eq!(a1.residual, b1.residual, "A and B agree on the junior pool");
     assert_eq!(a1.residual, c1.residual, "A and C agree on the junior pool");
-    assert_eq!(a_fin.vault, b_fin.vault, "FIXED: the ordering costs the vault nothing");
+    assert_eq!(
+        a_fin.vault, b_fin.vault,
+        "FIXED: the ordering costs the vault nothing"
+    );
     assert_eq!(a_fin.vault, c_fin.vault);
-    assert_eq!(a_fin.residual, b_fin.residual, "FIXED: the junior pool is ordering-independent");
+    assert_eq!(
+        a_fin.residual, b_fin.residual,
+        "FIXED: the junior pool is ordering-independent"
+    );
     assert_eq!(a_fin.residual, c_fin.residual);
 
     // LIVENESS: every ordering winds the whole market down; nobody is stuck.
@@ -871,8 +917,15 @@ fn q2_withdraw_gate_refuses_a_lapsed_fresh_bucket() {
     let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
     let (status, expiry, fresh) = long_bucket(&market);
     let vault_before = market.header.vault.get();
-    assert_eq!(status, BackingBucketStatusV16::Fresh, "nobody cranked it yet");
-    assert!(expiry <= market.header.current_slot.get(), "the bucket is LAPSED");
+    assert_eq!(
+        status,
+        BackingBucketStatusV16::Fresh,
+        "nobody cranked it yet"
+    );
+    assert!(
+        expiry <= market.header.current_slot.get(),
+        "the bucket is LAPSED"
+    );
 
     let w = market.withdraw_fresh_counterparty_backing_not_atomic(0, Q2_BACKING);
     println!(
@@ -939,10 +992,12 @@ fn q2_withdraw_gate_now_agrees_with_its_siblings_on_the_clock() {
         let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
         market.withdraw_fresh_counterparty_backing_not_atomic(0, Q2_BACKING)
     };
-    println!(
-        "[Q2 boundary] now=expiry-1 -> {last_legal:?}   now=expiry -> {first_lapsed:?}"
+    println!("[Q2 boundary] now=expiry-1 -> {last_legal:?}   now=expiry -> {first_lapsed:?}");
+    assert_eq!(
+        last_legal,
+        Ok(()),
+        "the boundary is `expiry_slot <= now`, not `<`"
     );
-    assert_eq!(last_legal, Ok(()), "the boundary is `expiry_slot <= now`, not `<`");
     assert_eq!(
         first_lapsed,
         Err(V16Error::LockActive),
