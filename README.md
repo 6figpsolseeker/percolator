@@ -224,19 +224,104 @@ price diverge.
 ## Build and Test
 
 ```bash
-# Run the full test suite (uses MAX_ACCOUNTS=64 for speed)
-cargo test --features test
+# Default suite
+cargo test                          # 312 tests, 0 failures
 
-# Run property tests and edge-case harnesses
-cargo test --features test -- --include-ignored
+# With the fuzz/property targets (v16_fuzzing is `required-features = ["fuzz"]`)
+cargo test --features fuzz          # 365 tests, 0 failures
 
-# Run Kani formal verification proofs (one-time setup required)
-cargo install --locked kani-verifier
-cargo kani setup
-cargo kani
-
-# 471 Kani proof harnesses, 1,265 tests, 0 failures
+# With the O(N) account-table invariant scans. This feature is the ONLY build in which
+# validate_shape_full_audit_scan / validate_asset_shape_for_view compile in at all, so the
+# default suite being green says nothing about them. CI runs these two as the `audit-scan` job.
+cargo test --features audit-scan --test v16_spec_tests   # 179 tests, 0 failures
+cargo test --features audit-scan --lib                   # 67 tests, 0 failures
 ```
+
+`v16_spec_tests` runs 179 under `audit-scan` and 180 by default: exactly one test is
+`#[cfg(not(feature = "audit-scan"))]`, because its fixture is deliberately off-model for the
+Live matched-book invariant — see the comment above
+`v16_auto_crank_does_not_liquidate_against_unmatched_effective_oi`.
+
+The `audit-scan` job is deliberately scoped to those two targets. `cargo test --features
+audit-scan` across ALL targets is **not** green today: `tests/grief_econ_final.rs` is 5/2, and
+both failures (`:146`, `:208`) are the same hand-written-fixture shape the spec suite's seven
+had — `Err(InvalidConfig)` from `validate_shape()` on state a helper assigned directly, never
+produced by an engine instruction. That is untriaged, so it is not in the gate yet.
+
+There is no `test` feature; the declared features are `stress`, `fuzz`, `audit-scan` and
+`fork-facade` (`Cargo.toml`), with `default = []`.
+
+## Kani
+
+**Pinned to Kani 0.67.0.** `scripts/run_kani_full_audit.sh` refuses to run against any other
+version: harness counts, the JSON schema of `kani-list.json`, and which unstable flags are
+required all move between Kani releases, and a results table that does not name its verifier
+version cannot be reproduced.
+
+```bash
+# One-time setup
+cargo install --locked kani-verifier@0.67.0
+cargo kani setup
+
+# All harnesses. --features fuzz is REQUIRED, not optional: [workspace.metadata.kani] sets
+# `flags = { tests = true }`, so cargo builds every test target, and the v16_fuzzing target
+# is `required-features = ["fuzz"]`. Without it cargo aborts before any proof runs:
+#   error: target `v16_fuzzing` in package `percolator` requires the features: `fuzz`
+cargo kani --tests --features fuzz
+
+# One harness (the fully-qualified name; --exact matches same-named harnesses across files)
+cargo kani --tests --features fuzz --jobs 1 --harness HARNESS_NAME
+
+# Long audits: one harness per process, with a 20-minute cap and a results TSV
+bash scripts/run_kani_full_audit.sh
+```
+
+### Harness census
+
+Counted at this checkout, not carried forward from a previous one:
+
+| Class | Count | Where |
+| --- | ---: | --- |
+| `#[kani::proof]` harnesses | **328** | `tests/proofs_v16.rs` 283, `tests/proofs_v17_fork.rs` 30, `tests/proofs_v16_arithmetic.rs` 13, `tests/proofs_v16_asymmetric_a_accrual.rs` 2 |
+| `#[kani::proof_for_contract]` harnesses | **0** | this fork has no `contracts` feature and no `src/v16_proofs.rs` |
+
+```bash
+# Reproduce both numbers. Exclude comment lines: a `#[kani::proof]` written inside a doc
+# comment is not a harness (there are 3 such lines, e.g. tests/proofs_v17_fork.rs:1078).
+grep -rn '#\[kani::proof\]' --include='*.rs' . | grep -vE ':\s*//' | wc -l   # 328
+grep -rn '#\[kani::proof_for_contract' --include='*.rs' . | wc -l            # 0
+```
+
+`kani-list.json` is the machine-readable form of the same census and agrees: 328
+standard harnesses, 0 contract harnesses, `"kani-version": "0.67.0"`. Regenerate it with
+
+```bash
+# `cargo kani list` (0.67.0) accepts no cargo flags, so the features have to reach it
+# through the manifest for the duration of the run.
+sed -i.bak 's/flags = { tests = true }/flags = { tests = true, features = ["fuzz"] }/' Cargo.toml
+cargo kani list --format json -Z stubbing    # -Z stubbing: tests/proofs_v17_fork.rs:1191 uses #[kani::stub]
+mv Cargo.toml.bak Cargo.toml
+```
+
+**On the contract layer.** Upstream (`aeyakovenko/percolator`) carries a `contracts` feature and
+61 `#[kani::proof_for_contract]` harnesses in `src/v16_proofs.rs`, run there with
+`cargo kani --tests --features fuzz,contracts -Z function-contracts`. **That invocation does not
+apply to this fork**: `Cargo.toml` declares no `contracts` feature and this tree has no
+`src/v16_proofs.rs`, so the command fails at cargo. Five upstream contract properties are carried
+here as plain `#[kani::proof]` harnesses that assert the same postcondition over the same
+unconstrained domain — `proof_v16_terminal_source_haircut_reserved_exactly_once`,
+`proof_v16_kernel_advance_leg_b_snap_rank_witness`,
+`proof_v16_kernel_initial_margin_gate_exact_decision`,
+`proof_v16_kernel_accumulate_batch_trade_exact_fold` and
+`proof_v16_kernel_settle_principal_exact_paid_and_conservation` (plus
+`proof_v16_cert_is_current_matches_the_favorable_action_gate` for upstream's
+`contract_check_kernel_cert_is_current`). They are inside the 328, not additional to it; each
+names its upstream contract in a comment above the harness.
+
+**A SUCCESSFUL harness is not by itself evidence.** Kani reports SUCCESSFUL for a harness whose
+`kani::cover!` properties are unreachable. Judge every result on its cover line as well —
+`0 of N cover properties satisfied` means the harness proved nothing. The CI smoke job gates on
+exactly that.
 
 ## Security
 
