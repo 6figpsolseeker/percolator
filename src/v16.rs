@@ -9536,6 +9536,24 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             }
         }
 
+        // The scan above only covers `[scan_start_asset_index, scan_end)`, so any
+        // asset BELOW the continuation cursor is never inspected on this call. The
+        // direct entry `retire_terminal_unbudgeted_insurance_not_atomic` refuses
+        // retirement while any asset still owes a claim-free provider recredit; the
+        // crank fall-through must not be weaker, or `ReadyToClose` burns the owed
+        // atoms (vault -> 0 with `insurance_domain_spent_*` and
+        // `provider_receivable_num` still nonzero, and `validate_shape` silent).
+        //
+        // Rewinding via `ScanProgress` rather than failing with `LockActive` keeps
+        // the wrapper's persisted-cursor protocol live: a hard error would leave
+        // `terminal_slab_scan_progress` pinned above the skipped asset and dead-end
+        // the close sequence forever. The returned index is strictly below the
+        // cursor (anything at or above it was just inspected), so the next call
+        // recredits it and the scan makes progress.
+        if let Some(next_asset_index) = self.first_terminal_claim_free_recredit_asset()? {
+            return Ok(TerminalSlabOutcomeV16::ScanProgress { next_asset_index });
+        }
+
         if self.header.backing_provider_earnings_total.get() != 0
             || self.header.source_fresh_backing_total_num.get() != 0
         {
