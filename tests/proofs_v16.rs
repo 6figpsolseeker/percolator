@@ -19973,4 +19973,157 @@ fn proof_v16_forfeit_dead_leg_classifier_is_exact_with_drainonly_wind_down() {
         !dead && mode_raw != 2 && lifecycle == AssetLifecycleV16::Active && side_is_dead,
         "X-01: forfeit classifier still REFUSES a dead side mode on an Active asset"
     );
+/// Two active assets, constructor-equivalent POD state — the fixture upstream's
+/// `closure_*` source-lien proofs use (`av/codex/lof-dos-proof-sweep-20260712:
+/// src/v16_proofs.rs::two_asset_kf_mapping_fixture`), ported here verbatim so the
+/// ported harness below runs on the same shape it was written against. Building
+/// the state directly avoids pulling activation's separately proven branch tree
+/// into the harness.
+fn two_asset_kf_mapping_fixture() -> (
+    MarketGroupV16HeaderAccount,
+    [Market<u64>; 2],
+    PortfolioAccountV16Account,
+) {
+    let market_group_id = [1u8; 32];
+    let cfg = V16Config::public_user_fund_with_market_slots(2, 2, 0, 10);
+    let mut header = MarketGroupV16HeaderAccount::default();
+    header.market_group_id = market_group_id;
+    header.config = V16ConfigAccount::from_runtime(&cfg);
+    header.asset_slot_capacity = V16PodU32::new(2);
+    header.next_market_id = V16PodU64::new(3);
+    header.asset_activation_count = V16PodU64::new(2);
+    header.last_asset_activation_slot = V16PodU64::new(2);
+    header.current_slot = V16PodU64::new(2);
+    header.asset_set_epoch = V16PodU64::new(2);
+    header.risk_epoch = V16PodU64::new(2);
+    header.vault = V16PodU128::new(10);
+    header.insurance = V16PodU128::new(10);
+    header.insurance_domain_budget_remaining_total = V16PodU128::new(10);
+    let mut markets = [
+        Market::new(0u64, EngineAssetSlotV16Account::empty_for_market(1)),
+        Market::new(0u64, EngineAssetSlotV16Account::empty_for_market(2)),
+    ];
+    let mut asset_index = 0usize;
+    while asset_index < 2 {
+        let mut asset = AssetStateV16::default();
+        asset.market_id = asset_index as u64 + 1;
+        asset.lifecycle = AssetLifecycleV16::Active;
+        asset.raw_oracle_target_price = 100;
+        asset.effective_price = 100;
+        asset.fund_px_last = 100;
+        asset.slot_last = asset_index as u64 + 1;
+        markets[asset_index].engine.asset = AssetStateV16Account::from_runtime(&asset);
+        asset_index += 1;
+    }
+    markets[0].engine.insurance_domain_budget_long = V16PodU128::new(1);
+    markets[0].engine.insurance_domain_budget_short = V16PodU128::new(2);
+    markets[1].engine.insurance_domain_budget_long = V16PodU128::new(3);
+    markets[1].engine.insurance_domain_budget_short = V16PodU128::new(4);
+
+    let provenance = ProvenanceHeaderV16Account::from_runtime(&ProvenanceHeaderV16::new(
+        market_group_id,
+        [2u8; 32],
+        [3u8; 32],
+    ));
+    let mut account = PortfolioAccountV16Account::default();
+    account.provenance_header = provenance;
+    account.owner = [3u8; 32];
+    (header, markets, account)
+}
+
+// PORTED FROM UPSTREAM. Anatoly's `faa3bcf9` ("Fail closed on expired
+// counterparty liens", 2026-07-15, `av/codex/lof-dos-proof-sweep-20260712`)
+// ships this harness in `src/v16_proofs.rs` behind `cfg(all(kani, feature =
+// "closure"))`. This fork has no `src/v16_proofs.rs` and no `closure` feature,
+// so the harness moves to `tests/proofs_v16.rs` (whole file is `#![cfg(kani)]`)
+// in house style: plain `#[kani::proof]`, no feature gate, and the call goes
+// through the `kani_account_source_realizable_support` shim because the
+// production fn is private and this file is out-of-crate. Upstream's
+// `#[kani::stub(crate::wide_math::div_rem_u256, bounded_u256_div_rem_stub)]` is
+// dropped: that stub does not exist in this fork, and the harness terminates
+// without it. Every assumption, cover and assertion is upstream's, verbatim.
+//
+// The property it states is exactly C-S-04 / item R:
+//
+// Expiry moves every counterparty lien in the domain from aggregate valid to
+// aggregate impaired without loading its owning portfolios. An untouched
+// portfolio therefore persists its old account-local lien labels until its
+// next bounded touch. Those stale labels must not remain favorable credit;
+// independently valid insurance in the same account must remain usable.
+#[kani::proof]
+#[kani::unwind(40)]
+#[kani::solver(cadical)]
+fn closure_expired_counterparty_lien_cannot_remain_favorable_account_credit() {
+    let counterparty_atoms_raw: u8 = kani::any();
+    let insurance_atoms_raw: u8 = kani::any();
+    kani::assume((1..=8).contains(&counterparty_atoms_raw));
+    kani::assume(insurance_atoms_raw <= 8);
+    let counterparty_atoms = counterparty_atoms_raw as u128;
+    let insurance_atoms = insurance_atoms_raw as u128;
+    let total_atoms = counterparty_atoms + insurance_atoms;
+    let counterparty_num = counterparty_atoms * BOUND_SCALE;
+    let insurance_num = insurance_atoms * BOUND_SCALE;
+    let total_num = total_atoms * BOUND_SCALE;
+
+    let (mut header, mut markets, mut account_header) = two_asset_kf_mapping_fixture();
+    account_header
+        .init_empty_in_place(account_header.provenance_header)
+        .unwrap();
+    let market_id = markets[0].engine.asset.market_id;
+    header.current_slot = V16PodU64::new(20);
+    account_header.pnl = V16PodI128::new(total_atoms as i128);
+    let account_source = &mut account_header.source_domains[0];
+    account_source.domain = V16PodU32::new(0);
+    account_source.source_claim_market_id = market_id;
+    account_source.source_claim_bound_num = V16PodU128::new(total_num);
+    account_source.source_claim_liened_num = V16PodU128::new(total_num);
+    account_source.source_claim_counterparty_liened_num = V16PodU128::new(counterparty_num);
+    account_source.source_claim_insurance_liened_num = V16PodU128::new(insurance_num);
+    account_source.source_lien_effective_reserved = V16PodU128::new(total_atoms);
+    account_source.source_lien_counterparty_backing_num = V16PodU128::new(counterparty_num);
+    account_source.source_lien_insurance_backing_num = V16PodU128::new(insurance_num);
+
+    // Exact aggregate state after expiry: counterparty backing is impaired;
+    // the independently funded insurance lien remains valid.
+    markets[0].engine.source_credit_long =
+        SourceCreditStateV16Account::from_runtime(&SourceCreditStateV16 {
+            positive_claim_bound_num: total_num,
+            exact_positive_claim_num: total_num,
+            impaired_liened_backing_num: counterparty_num,
+            insurance_credit_reserved_num: insurance_num,
+            valid_liened_insurance_num: insurance_num,
+            credit_rate_num: 0,
+            credit_epoch: 1,
+            ..SourceCreditStateV16::EMPTY
+        });
+    markets[0].engine.backing_long = BackingBucketV16Account::from_runtime(&BackingBucketV16 {
+        market_id: market_id.get(),
+        impaired_liened_backing_num: counterparty_num,
+        expiry_slot: 5,
+        status: BackingBucketStatusV16::Impaired,
+        ..BackingBucketV16::EMPTY
+    });
+    markets[0].engine.insurance_reservation_long =
+        InsuranceCreditReservationV16Account::from_runtime(&InsuranceCreditReservationV16 {
+            insurance_credit_reserved_num: insurance_num,
+            valid_liened_insurance_num: insurance_num,
+            ..InsuranceCreditReservationV16::EMPTY
+        });
+
+    let market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    let account = PortfolioV16View::new(&account_header);
+    assert_eq!(account.validate_with_market(&market.as_view()), Ok(()));
+    let support = market
+        .kani_account_source_realizable_support(&account, total_atoms)
+        .unwrap();
+
+    kani::cover!(
+        insurance_atoms == 0,
+        "expired counterparty-only lien has no favorable support"
+    );
+    kani::cover!(
+        insurance_atoms > 0,
+        "mixed lien retains only independently valid insurance support"
+    );
+    assert_eq!(support, insurance_atoms);
 }

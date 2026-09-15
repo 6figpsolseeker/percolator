@@ -292,7 +292,9 @@ fn r_regression_impaired_backing_yields_no_support_and_the_account_is_liquidatab
          this account its impaired-claim relabel"
     );
     assert_eq!(
-        long.header.source_domains[0].source_claim_impaired_num.get(),
+        long.header.source_domains[0]
+            .source_claim_impaired_num
+            .get(),
         0
     );
 
@@ -359,9 +361,8 @@ fn r_regression_impaired_backing_yields_no_support_and_the_account_is_liquidatab
     );
 
     // === (1d) THE POINT: the underwater account is LIQUIDATABLE ============
-    let liq = market.liquidate_account_not_atomic(&mut long, LiquidationRequestV16 {
-        asset_index: 0,
-    });
+    let liq =
+        market.liquidate_account_not_atomic(&mut long, LiquidationRequestV16 { asset_index: 0 });
     println!("LIQUIDATE liquidate_account_not_atomic => {liq:?}");
     let outcome = liq.expect("the underwater account must be liquidatable");
     assert!(
@@ -536,7 +537,9 @@ fn r_regression_flat_normalizer_still_clears_and_valuation_is_clearer_invariant(
         0
     );
     assert_eq!(
-        long.header.source_domains[0].source_claim_impaired_num.get(),
+        long.header.source_domains[0]
+            .source_claim_impaired_num
+            .get(),
         LIEN_EFFECTIVE * BOUND_SCALE,
         "the forfeited face still lands in the impaired lane"
     );
