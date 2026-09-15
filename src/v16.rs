@@ -1141,6 +1141,83 @@ impl V16Core {
         Ok(ledger)
     }
 
+    /// PRODUCTION KERNEL: credit a mid-close PRINCIPAL settlement to the open
+    /// close ledger (F-02, ledger half).
+    ///
+    /// The five progress categories of `kernel_advance_close_ledger` all record
+    /// loss absorbed by someone OTHER than the debtor (senior support, insurance,
+    /// the loss-bearing side's social-loss index, an explicit write-off). None of
+    /// them fires when the DEBTOR pays part of its own debt from principal —
+    /// `settle_negative_pnl_from_principal_core_not_atomic` lowers `pnl` and
+    /// touches no ledger field. `drift_consumed`, the only other term in the
+    /// equation, has no writer and is additive anyway.
+    ///
+    /// So `residual_remaining` stayed at the figure captured when the close
+    /// opened even after the debt itself was partly paid. Booking the fresh
+    /// residual (the `min` at the booking site) stops the group being
+    /// over-charged, but on its own it leaves the ledger permanently short of
+    /// `finalized`: once the account's own loss reaches zero every later
+    /// `CloseResolved` returns early at `pnl >= 0`, nothing ever lowers the
+    /// ledger, and `pending_domain_loss_barrier_*` stays raised — which
+    /// `begin_close_progress_ledger` then reads to refuse EVERY future
+    /// bankruptcy close in that (asset, domain). That is the F-02 route-1c
+    /// brick, and it is what this kernel closes.
+    ///
+    /// The principal payment genuinely shrinks the loss the close set out to
+    /// absorb, so it is booked against `gross_loss_at_close_start`, keeping the
+    /// residual equation exact rather than writing `residual_remaining`
+    /// directly. The credit is clamped to the residual still outstanding (and to
+    /// the gross itself), so the equation can never go negative and a payment
+    /// larger than the remaining debt cannot manufacture progress. The debtor's
+    /// side of the same payment is already recorded on the ACCOUNT by
+    /// `record_account_residual_crystallized_loss`, so no audit fact is lost.
+    ///
+    /// Pure on `(CloseProgressLedgerV16, u128)`; the glue calls exactly this.
+    pub(crate) fn kernel_settle_close_ledger_principal(
+        mut ledger: CloseProgressLedgerV16,
+        principal_paid: u128,
+    ) -> V16Result<CloseProgressLedgerV16> {
+        if principal_paid == 0 || !ledger.active || ledger.finalized || ledger.canceled {
+            return Ok(ledger);
+        }
+        let total_loss = ledger
+            .gross_loss_at_close_start
+            .checked_add(ledger.drift_consumed)
+            .ok_or(V16Error::ArithmeticOverflow)?;
+        let progress = ledger
+            .support_consumed
+            .checked_add(ledger.insurance_spent)
+            .and_then(|v| v.checked_add(ledger.b_loss_booked))
+            .and_then(|v| v.checked_add(ledger.explicit_loss_assigned))
+            .ok_or(V16Error::ArithmeticOverflow)?;
+        if progress > total_loss {
+            return Err(V16Error::ArithmeticOverflow);
+        }
+        let outstanding = total_loss - progress;
+        let cured = principal_paid
+            .min(outstanding)
+            .min(ledger.gross_loss_at_close_start);
+        if cured == 0 {
+            return Ok(ledger);
+        }
+        ledger.gross_loss_at_close_start = ledger
+            .gross_loss_at_close_start
+            .checked_sub(cured)
+            .ok_or(V16Error::ArithmeticOverflow)?;
+        let total_loss = ledger
+            .gross_loss_at_close_start
+            .checked_add(ledger.drift_consumed)
+            .ok_or(V16Error::ArithmeticOverflow)?;
+        if progress > total_loss {
+            return Err(V16Error::ArithmeticOverflow);
+        }
+        ledger.residual_remaining = total_loss - progress;
+        if ledger.residual_remaining == 0 {
+            ledger.finalized = true;
+        }
+        Ok(ledger)
+    }
+
     /// PRODUCTION KERNEL: the attach-leg core — snapshot the side's basis
     /// anchors, gate the a-basis range, add open interest, and construct the
     /// new leg. Pure on (AssetStateV16, scalars); the attach glue calls
@@ -5103,7 +5180,14 @@ impl<'a> PortfolioV16View<'a> {
         if source_claim_sum_num != 0 {
             let source_attributed_pnl =
                 if decode_market_mode(market.header.mode)? == MarketModeV16::Resolved {
-                    pnl.max(0) as u128 - self.header.reserved_pnl.get()
+                    // Guarded ~13 lines above, but keep the guard local to the use:
+                    // a wrapped value here does not make
+                    // `validate_positive_pnl_source_attribution` wrong, it makes it
+                    // disappear (`u128::MAX as i128 == -1` hits its `pnl <= 0` early
+                    // return), silently dropping the source-domain realizability cap.
+                    (pnl.max(0) as u128)
+                        .checked_sub(self.header.reserved_pnl.get())
+                        .ok_or(V16Error::CounterUnderflow)?
                 } else {
                     pnl.max(0) as u128
                 };
@@ -9534,6 +9618,24 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
                     next_asset_index: scan_end,
                 });
             }
+        }
+
+        // The scan above only covers `[scan_start_asset_index, scan_end)`, so any
+        // asset BELOW the continuation cursor is never inspected on this call. The
+        // direct entry `retire_terminal_unbudgeted_insurance_not_atomic` refuses
+        // retirement while any asset still owes a claim-free provider recredit; the
+        // crank fall-through must not be weaker, or `ReadyToClose` burns the owed
+        // atoms (vault -> 0 with `insurance_domain_spent_*` and
+        // `provider_receivable_num` still nonzero, and `validate_shape` silent).
+        //
+        // Rewinding via `ScanProgress` rather than failing with `LockActive` keeps
+        // the wrapper's persisted-cursor protocol live: a hard error would leave
+        // `terminal_slab_scan_progress` pinned above the skipped asset and dead-end
+        // the close sequence forever. The returned index is strictly below the
+        // cursor (anything at or above it was just inspected), so the next call
+        // recredits it and the scan makes progress.
+        if let Some(next_asset_index) = self.first_terminal_claim_free_recredit_asset()? {
+            return Ok(TerminalSlabOutcomeV16::ScanProgress { next_asset_index });
         }
 
         if self.header.backing_provider_earnings_total.get() != 0
@@ -17089,6 +17191,50 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         account.validate_with_market(&self.as_view())
     }
 
+    /// F-02 (ledger half): book a mid-close PRINCIPAL settlement as close
+    /// progress, so the open ledger tracks the debt that is actually left.
+    ///
+    /// Mirrors `advance_close_progress_ledger`, including the
+    /// `pending_domain_loss_barrier_*` release when the ledger stops having a
+    /// pending residual — without that release the barrier stays raised and
+    /// `begin_close_progress_ledger` refuses every future bankruptcy close in the
+    /// same (asset, domain).
+    ///
+    /// Deliberately NOT fail-closed on a stale/expired ledger: this runs inside
+    /// `settle_negative_pnl_from_principal_core_not_atomic`, which is called from
+    /// eleven sites including plain liquidation and refresh, and a new error
+    /// return there would turn a recoverable ledger state into a revert on an
+    /// unrelated path. A ledger that is not open, or where the credit is zero,
+    /// is left byte-identical.
+    fn credit_close_progress_principal_settlement(
+        &mut self,
+        account: &mut PortfolioV16ViewMut<'_>,
+        principal_paid: u128,
+    ) -> V16Result<()> {
+        if principal_paid == 0 {
+            return Ok(());
+        }
+        let ledger = account.header.close_progress.try_to_runtime()?;
+        if !ledger.active || ledger.finalized || ledger.canceled {
+            return Ok(());
+        }
+        let was_pending = ledger.has_pending_residual();
+        let domain_side = ledger.domain_side;
+        let asset_index = ledger.asset_index as usize;
+        let ledger = V16Core::kernel_settle_close_ledger_principal(ledger, principal_paid)?;
+        if was_pending && !ledger.has_pending_residual() {
+            let count = self.pending_domain_loss_barrier_count(asset_index, domain_side)?;
+            self.set_pending_domain_loss_barrier_count(
+                asset_index,
+                domain_side,
+                count.checked_sub(1).ok_or(V16Error::CounterUnderflow)?,
+            )?;
+        }
+        account.header.close_progress = CloseProgressLedgerV16Account::from_runtime(&ledger);
+        account.header.health_cert.valid = 0;
+        Ok(())
+    }
+
     fn bankruptcy_residual_single_step_capacity(
         &self,
         asset_index: usize,
@@ -17303,6 +17449,29 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         }))
     }
 
+    // F-02 regression PoC hook: exposes the outer per-account booking so a test can
+    // drive a multi-chunk close with a principal settlement interleaved between chunks
+    // and observe the residual actually booked. Gated to the same builds as the other
+    // proof/fuzz shims; absent from the wrapper/production build.
+    #[cfg(any(kani, feature = "fuzz"))]
+    pub fn kani_book_bankruptcy_residual_chunk_for_account_core(
+        &mut self,
+        account: &mut PortfolioV16ViewMut<'_>,
+        asset_index: usize,
+        bankrupt_side: SideV16,
+        residual_remaining: u128,
+    ) -> V16Result<(u128, u128)> {
+        let outcome = self.book_bankruptcy_residual_chunk_for_account_core(
+            account,
+            asset_index,
+            bankrupt_side,
+            residual_remaining,
+        )?;
+        // (booked_loss, explicit_loss) — their sum is the residual actually socialised
+        // by this chunk, which the F-02 regression compares against the fresh residual.
+        Ok((outcome.booked_loss, outcome.explicit_loss))
+    }
+
     #[cfg(kani)]
     pub fn kani_book_bankruptcy_residual_chunk_internal(
         &mut self,
@@ -17344,12 +17513,14 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             });
         }
         let domain_side = opposite_side(bankrupt_side);
-        // Defence in depth: every caller of this function already opens a close
-        // when the gross loss is non-zero, so a finalized-inert ledger is not
-        // reachable here today. Asking the same question as the sibling site keeps
-        // the two consistent if that ever changes. The capacity pre-flight stays on
-        // this branch so a residual with no bookable capacity still routes to
-        // recovery rather than erroring.
+        // A finalized-inert ledger IS reachable here (F-02, ledger half): a
+        // principal settlement that fully extinguishes the open ledger while the
+        // account still carries loss arrives through
+        // `advance_pending_close_residual_not_atomic`, which has no `begin` before
+        // this booking core. Asking the same question as the sibling site opens a
+        // fresh close for the loss that genuinely remains. The capacity pre-flight
+        // stays on this branch so a residual with no bookable capacity still routes
+        // to recovery rather than erroring.
         if account
             .header
             .close_progress
@@ -17383,7 +17554,16 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         let outcome = self.book_bankruptcy_residual_chunk_internal(
             asset_index,
             bankrupt_side,
-            ledger.residual_remaining,
+            // F-02: book the FRESH residual (recomputed by the caller from the account's
+            // current pnl AFTER principal settlement and insurance), capped by the ledger's
+            // remaining. The raw captured `ledger.residual_remaining` is only lowered by
+            // booked loss, never by a mid-close principal settlement (owner deposit before a
+            // resolved close, or a liquidation between Live chunks), so booking it here
+            // over-socialised: the loss-bearing side and insurance were charged the
+            // pre-settlement residual while the account's own credit was clamped at the true
+            // loss. Taking the min never books more than either the current loss or the
+            // ledger's tracked remaining.
+            residual_remaining.min(ledger.residual_remaining),
         )?;
         self.advance_close_progress_ledger(
             account,
@@ -19160,6 +19340,12 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         self.header.c_tot = V16PodU128::new(c_tot);
         self.set_account_pnl_after_principal_settlement(account, new_pnl)?;
         Self::record_account_residual_crystallized_loss(account, paid)?;
+        // F-02 (ledger half): the debt an open close ledger is tracking just got
+        // smaller by `paid`. Credit it before the hlock auto-clear below, so a
+        // settlement that finishes the close releases
+        // `pending_domain_loss_barrier_*` in the same call and the hlock can go
+        // down with it.
+        self.credit_close_progress_principal_settlement(account, paid)?;
         if new_pnl < 0 {
             self.header.bankruptcy_hlock_active = 1;
         }
@@ -19204,25 +19390,31 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
     //                                  single user controls, and whose over-lock window is
     //                                  bounded by max_bankrupt_close_lifetime_slots.
     //
-    //   explicit_unallocated_loss_*    the designated unallocatable-loss sink. HONEST
-    //                                  STATUS: this field has ZERO write sites in the
-    //                                  engine, so the row never fires — but calling it
-    //                                  "inert" would be wrong and was wrong in an earlier
-    //                                  revision of this comment. The engine DOES compute
-    //                                  unallocatable loss, as
-    //                                  `BResidualBookingOutcomeV16::explicit_loss`
-    //                                  (:12249/:12269/:12294), and then books it into the
+    //   explicit_unallocated_loss_*    NOT a term (removed, F-03). The realized
+    //                                  unallocatable-loss sink: whole atoms of social loss
+    //                                  that `kernel_normalize_social_loss_carry` could not
+    //                                  assign to any side's weight, saturating-added on a
+    //                                  leg clear (`kernel_clear_leg`) and cleared only at
+    //                                  retirement. (An earlier revision of this note said
+    //                                  the field had ZERO write sites; that is no longer
+    //                                  true.) It was a term here on the theory that it
+    //                                  flags unabsorbed loss — but it is a REALIZED
+    //                                  write-off, not pending loss (no crank or settlement
+    //                                  ever consumes it), so gating the group hlock on it
+    //                                  recreated the exact HOSTAGE this predicate was
+    //                                  narrowed to avoid: an ordinary close leaves a dust
+    //                                  atom that freezes LP/insurance withdrawals and
+    //                                  oracle reconfiguration group-wide, and for asset 0
+    //                                  (which RETIRE rejects) permanently. Its written
+    //                                  siblings social_loss_dust/remainder are, correctly,
+    //                                  already excluded for the same reason. The bankruptcy
+    //                                  path additionally books unallocatable loss into the
     //                                  per-ACCOUNT `close_progress.explicit_loss_assigned`
-    //                                  (:12114) where it counts as PROGRESS — finalizing
-    //                                  the ledger, dropping pending_domain_loss_barrier_*
-    //                                  and zeroing the bankrupt account's PnL, with no
-    //                                  asset-level record left behind. So on the one path
-    //                                  that produces the thing this row exists to catch,
-    //                                  the hlock clears in the same call sequence that
-    //                                  writes the loss off. The row is kept so the
-    //                                  predicate is already correct if the asset-level sink
-    //                                  is ever wired up; the gap itself is pre-existing and
-    //                                  is NOT closed here.
+    //                                  where it counts as PROGRESS. The write-off still
+    //                                  blocks slot reactivation/retire via
+    //                                  `asset_state_is_empty_for_activation`, so it is
+    //                                  recorded, not lost — only demoted from a group-freeze
+    //                                  signal to the residual-state signal it is.
     //
     // b_*/b_epoch_start_* (absorbed-loss bookkeeping, monotone) and social_loss_dust/
     // remainder (sub-atom quarantine sink that never drains) are intentionally excluded.
@@ -19267,10 +19459,22 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             // ONLY genuine unabsorbed-loss ledgers gate the hlock. Deliberately NOT the
             // side mode byte — see the note above the function for why that term was
             // dropped.
+            // F-03: `explicit_unallocated_loss_*` is a REALIZED write-off — whole atoms of
+            // social loss that `kernel_normalize_social_loss_carry` could not assign to any
+            // side's weight, saturating-added on a leg clear and cleared only at asset
+            // retirement. It is not pending, absorbable loss: no crank or settlement will
+            // ever consume it. Gating the group-wide hlock on it recreated exactly the
+            // HOSTAGE this predicate was narrowed to avoid (see the note above) — an ordinary
+            // close leaves a dust atom that latches LP/insurance withdrawals and oracle
+            // reconfiguration for EVERY domain in the group, and for asset 0 (which RETIRE
+            // rejects) the latch is permanent. Its written siblings `social_loss_dust_*` /
+            // `social_loss_remainder_*` were already, correctly, not gated here for the same
+            // reason. `pending_domain_loss_barrier_*` remains: it IS genuine loss awaiting
+            // domain absorption. The write-off still blocks slot reactivation/retire through
+            // `asset_state_is_empty_for_activation`, so it is not lost — only demoted from a
+            // group-freeze signal to the residual-state signal it actually is.
             if slot.pending_domain_loss_barrier_long.get() != 0
                 || slot.pending_domain_loss_barrier_short.get() != 0
-                || slot.asset.explicit_unallocated_loss_long.get() != 0
-                || slot.asset.explicit_unallocated_loss_short.get() != 0
             {
                 return true;
             }
@@ -21131,16 +21335,50 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         )
     }
 
+    /// Dead-leg forfeit/detach is a TERMINAL-asset exit, never a live-market one.
+    ///
+    /// Spec: requirement 30 (`av spec.md:65`) — "public markets MUST expose bounded
+    /// owner-callable dead-leg forfeit/detach for *terminal/recovery* assets" — restated at
+    /// `av spec.md:1580` ("bounded and owner-callable for terminal/recovery/dead assets"). Both
+    /// exits of `forfeit_recovery_leg_not_atomic` remove ONE side's `oi_eff` with no paired
+    /// opposite-side reduction: the clean-detach arm calls `clear_leg` (`kernel_clear_leg`
+    /// subtracts `oi_eff_<side>` and `loss_weight_sum_<side>` alone), and the retention arm calls
+    /// `kernel_retain_leg_as_pending_obligation`, whose upstream contract pins the opposite side
+    /// as byte-unchanged. So admitting the exit on an asset that is still trading ends the
+    /// instruction with `oi_eff_long != oi_eff_short` on a Live market — forbidden by
+    /// `av spec.md:952` ("if Live: OI_eff_long == OI_eff_short", stated for every
+    /// Active/DrainOnly/Recovery asset side) and skipping `spec.md:1239` (§8.1 step 9, "assert OI
+    /// symmetry for side-mutating/live-exposure instructions", with `:1242` foreclosing the
+    /// early-return defence). `validate_asset_shape_for_view` says the same in code: its
+    /// matched-book conjunct exempts `lifecycle == Recovery` only, on the stated rationale that
+    /// "Active/DrainOnly enforcement is unchanged".
+    ///
+    /// The SIDE MODE is not the ASSET LIFECYCLE. `reduce_matching_open_interest_for_unilateral_close`
+    /// latches `mode_<side> = DrainOnly` whenever a single unilateral close drives the opposite
+    /// side's `A` factor under `MIN_A_SIDE`, and it touches no lifecycle. Before this gate the
+    /// third disjunct read `side_mode` alone, so one owner-signed unilateral close opened the
+    /// terminal exit on a fully Active/Live asset and left the book one-sided; every surviving
+    /// counterparty then read `unilateral_close_capacity = min(.., 0, ..) = 0` and could neither
+    /// reduce nor be liquidated, and `accrual_activity_for_asset_segment`'s `balanced_exposure`
+    /// switched funding off for the whole asset. Gate the side-mode disjunct on the asset
+    /// lifecycle so it only admits the terminal states the spec names.
+    ///
+    /// `AssetLifecycleV16::Recovery` still admits unconditionally through the second disjunct
+    /// (the owner exit a recovering asset relies on), and market-wide `MarketModeV16::Recovery`
+    /// through the first; the third disjunct now adds only `Retired`, the terminal lifecycle.
     fn leg_is_dead_for_forfeit(&self, asset_index: usize, side: SideV16) -> V16Result<bool> {
         let side_mode = self.side_mode_for(asset_index, side)?;
         let asset_lifecycle = self.asset_state(asset_index)?.lifecycle;
         Ok(
             decode_market_mode(self.header.mode)? == MarketModeV16::Recovery
                 || asset_lifecycle == AssetLifecycleV16::Recovery
-                || matches!(
+                || (matches!(
                     side_mode,
                     SideModeV16::DrainOnly | SideModeV16::ResetPending
-                ),
+                ) && matches!(
+                    asset_lifecycle,
+                    AssetLifecycleV16::Recovery | AssetLifecycleV16::Retired
+                )),
         )
     }
 
@@ -23589,6 +23827,56 @@ mod bankruptcy_hlock_clear_predicate_tests {
         assert_eq!(
             market.header.bankruptcy_hlock_active, 1,
             "hlock must stay engaged while a close ledger still has residual"
+        );
+    }
+
+    // F-03 regression: a REALIZED unallocatable write-off atom must NOT gate the group
+    // hlock. In production `kernel_clear_leg` -> `kernel_normalize_social_loss_carry`
+    // saturating-adds a whole SOCIAL_LOSS_DEN atom into `explicit_unallocated_loss_*` when a
+    // leg clear's `b_rem` crosses an atom with no side weight left to absorb it. That atom
+    // is cleared only at asset retirement, and RETIRE rejects asset 0 -- so gating the
+    // group-wide hlock on it froze LP/insurance withdrawals and oracle reconfiguration for
+    // EVERY domain, permanently. Here the only residual is that write-off (no domain-loss
+    // barrier, every header counter zero), so the hlock must clear.
+    #[test]
+    fn an_unallocatable_write_off_atom_does_not_latch_the_hlock() {
+        let (mut header, mut markets) = one_asset_market_fixture();
+        // The whole-atom dust a leg clear leaves behind (kernel_normalize_social_loss_carry).
+        markets[0].engine.asset.explicit_unallocated_loss_long = V16PodU128::new(1);
+        header.bankruptcy_hlock_active = 1;
+
+        let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+
+        // No genuine pending loss: no domain-loss barrier on either side.
+        assert_eq!(
+            market.markets[0]
+                .engine
+                .pending_domain_loss_barrier_long
+                .get(),
+            0
+        );
+        assert_eq!(
+            market.markets[0]
+                .engine
+                .pending_domain_loss_barrier_short
+                .get(),
+            0
+        );
+
+        assert!(
+            !market.group_has_unabsorbed_bankruptcy_loss(),
+            "a realized unallocatable write-off must not count as unabsorbed bankruptcy loss (F-03)"
+        );
+        market.try_clear_bankruptcy_hlock_if_healthy().unwrap();
+        assert_eq!(
+            market.header.bankruptcy_hlock_active, 0,
+            "hlock must clear once the only residual is an unallocatable write-off atom (F-03)"
+        );
+
+        // The write-off is still recorded as residual state: the slot is not reusable.
+        assert!(
+            market.asset_local_has_position_or_loss_state(0).unwrap(),
+            "the write-off stays recorded (still blocks slot reactivation), only demoted from a group freeze"
         );
     }
 
