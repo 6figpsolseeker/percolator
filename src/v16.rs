@@ -21479,6 +21479,22 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         )
     }
 
+    /// Kani-only re-export of the private classifier, so
+    /// `proof_v16_forfeit_dead_leg_classifier_is_exact_with_drainonly_wind_down`
+    /// (`tests/proofs_v16.rs`) can prove the admission set EXACTLY over symbolic
+    /// mode x lifecycle x side mode x `oi_eff` pair. Mirrors upstream's
+    /// `MarketGroupV16ViewMut::kani_leg_is_dead_for_forfeit`
+    /// (`aeyakovenko/percolator` `a2d7c75c:src/v16_kani_api.rs:629-635`); compiled out of every
+    /// non-Kani build, so the production surface is unchanged.
+    #[cfg(kani)]
+    pub fn kani_leg_is_dead_for_forfeit(
+        &self,
+        asset_index: usize,
+        side: SideV16,
+    ) -> V16Result<bool> {
+        self.leg_is_dead_for_forfeit(asset_index, side)
+    }
+
     fn settle_forfeited_leg_kf_effects(
         &mut self,
         account: &mut PortfolioV16ViewMut<'_>,
