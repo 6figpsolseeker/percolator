@@ -24,7 +24,8 @@ use percolator::{
     AutoCrankWorkV16, BackingBucketStatusV16, EngineAssetSlotV16Account, Market,
     MarketGroupV16HeaderAccount, MarketGroupV16ViewMut, PermissionlessProgressOutcomeV16,
     PortfolioAccountV16Account, PortfolioV16ViewMut, ProvenanceHeaderV16,
-    ProvenanceHeaderV16Account, ResolvedCloseOutcomeV16, TradeRequestV16, V16Config, V16PodU64,
+    ProvenanceHeaderV16Account, ResolvedCloseOutcomeV16, TradeRequestV16, V16Config, V16Error,
+    V16PodU64,
     v16_domain_count_for_market_slots,
 };
 use percolator::{BOUND_SCALE, POS_SCALE};
@@ -817,4 +818,135 @@ fn q_resolved_crank_order_no_longer_decides_the_stock_class() {
         }
         assert_eq!(fin.c_tot, 0, "{label}: full wind-down reaches c_tot == 0");
     }
+}
+
+// ===========================================================================
+// PART 3 — Q2: C-S-10b, `prepare_counterparty_backing_withdraw_delta`
+// ===========================================================================
+
+/// One provider-funded backing bucket on domain 0 with the provider's own
+/// `expiry_slot`, then the market clock moved to `now_slot`. Same shape as
+/// `verify/poc/C-S-10/poc_C_S_10.rs`'s fixture.
+fn backing_fixture(
+    backing_atoms: u128,
+    expiry_slot: u64,
+    now_slot: u64,
+) -> (MarketGroupV16HeaderAccount, Vec<Market<u64>>) {
+    let (market_id, _, _) = ids();
+    let cfg = V16Config::public_user_fund_with_market_slots(1, 1, 0, 10);
+    let mut header = MarketGroupV16HeaderAccount::new_dynamic(market_id, cfg, 1, 0).unwrap();
+    let mut markets = vec![Market::new(0, EngineAssetSlotV16Account::default())];
+    header
+        .activate_empty_asset_slot_not_atomic(0, &mut markets[0].engine, 100, 1)
+        .unwrap();
+    {
+        let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+        market
+            .deposit_fresh_counterparty_backing_not_atomic(0, backing_atoms, expiry_slot)
+            .expect("provider funds the bucket with its own deadline");
+        market.validate_shape().unwrap();
+    }
+    header.current_slot = V16PodU64::new(now_slot);
+    (header, markets)
+}
+
+fn long_bucket(market: &MarketGroupV16ViewMut<'_, u64>) -> (BackingBucketStatusV16, u64, u128) {
+    let b = market.markets[0]
+        .engine
+        .backing_long
+        .try_to_runtime()
+        .unwrap();
+    (b.status, b.expiry_slot, b.fresh_unliened_backing_num)
+}
+
+const Q2_BACKING: u128 = 100;
+const Q2_EXPIRY: u64 = 1_000;
+
+/// C-S-10b FIXED: wrapper tag 50 is refused on a bucket that is still `Fresh`
+/// but whose `expiry_slot` has lapsed — the principal the expiry rule forfeits
+/// to the junior pool is no longer paid out during the grace window.
+#[test]
+fn q2_withdraw_gate_refuses_a_lapsed_fresh_bucket() {
+    let (mut header, mut markets) = backing_fixture(Q2_BACKING, Q2_EXPIRY, Q2_EXPIRY + 500);
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    let (status, expiry, fresh) = long_bucket(&market);
+    let vault_before = market.header.vault.get();
+    assert_eq!(status, BackingBucketStatusV16::Fresh, "nobody cranked it yet");
+    assert!(expiry <= market.header.current_slot.get(), "the bucket is LAPSED");
+
+    let w = market.withdraw_fresh_counterparty_backing_not_atomic(0, Q2_BACKING);
+    println!(
+        "[Q2 lapsed] status={status:?} expiry={expiry} now={} fresh={fresh} tag50 -> {w:?}",
+        market.header.current_slot.get()
+    );
+    assert_eq!(
+        w,
+        Err(V16Error::LockActive),
+        "FIXED: the withdraw gate now tests the clock, like its lien-create and \
+         lien-release siblings"
+    );
+    assert_eq!(
+        market.header.vault.get(),
+        vault_before,
+        "the atoms stay in the vault and become junior residual"
+    );
+    let (status_after, _, fresh_after) = long_bucket(&market);
+    assert_eq!(status_after, status, "the refusal mutates nothing");
+    assert_eq!(fresh_after, fresh);
+    market.validate_shape().unwrap();
+}
+
+/// LIVENESS control: an unexpired `Fresh` bucket is still fully withdrawable,
+/// including at `current_slot == expiry_slot - 1`, the last legal slot.
+#[test]
+fn q2_withdraw_gate_still_allows_an_unexpired_fresh_bucket() {
+    // slot 0 is excluded: the market's asset slot is activated at slot 1, and
+    // rewinding the clock behind it makes the entry fail `InvalidConfig` for
+    // reasons unrelated to this gate (it predates the fix).
+    for now in [1u64, 2, 10, Q2_EXPIRY / 2, Q2_EXPIRY - 1] {
+        let (mut header, mut markets) = backing_fixture(Q2_BACKING, Q2_EXPIRY, now);
+        let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+        let vault_before = market.header.vault.get();
+        let w = market.withdraw_fresh_counterparty_backing_not_atomic(0, Q2_BACKING);
+        println!("[Q2 unexpired] now={now} expiry={Q2_EXPIRY} tag50 -> {w:?}");
+        w.unwrap_or_else(|e| {
+            panic!("LIVENESS: an unexpired bucket must stay withdrawable at slot {now}: {e:?}")
+        });
+        let (status_after, _, fresh_after) = long_bucket(&market);
+        assert_eq!(fresh_after, 0, "the principal left the bucket");
+        assert_eq!(status_after, BackingBucketStatusV16::Empty);
+        assert_eq!(
+            market.header.vault.get(),
+            vault_before - Q2_BACKING,
+            "the principal leaves the vault to the provider"
+        );
+        market.validate_shape().unwrap();
+    }
+}
+
+/// The asymmetry C-S-10 part (c) measured is gone: on ONE state, changing only
+/// `expiry_slot <= current_slot`, the withdraw gate now flips exactly where the
+/// lien-create and lien-release siblings flip.
+#[test]
+fn q2_withdraw_gate_now_agrees_with_its_siblings_on_the_clock() {
+    let last_legal = {
+        let (mut header, mut markets) = backing_fixture(Q2_BACKING, Q2_EXPIRY, Q2_EXPIRY - 1);
+        let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+        market.withdraw_fresh_counterparty_backing_not_atomic(0, Q2_BACKING)
+    };
+    let first_lapsed = {
+        let (mut header, mut markets) = backing_fixture(Q2_BACKING, Q2_EXPIRY, Q2_EXPIRY);
+        let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+        market.withdraw_fresh_counterparty_backing_not_atomic(0, Q2_BACKING)
+    };
+    println!(
+        "[Q2 boundary] now=expiry-1 -> {last_legal:?}   now=expiry -> {first_lapsed:?}"
+    );
+    assert_eq!(last_legal, Ok(()), "the boundary is `expiry_slot <= now`, not `<`");
+    assert_eq!(
+        first_lapsed,
+        Err(V16Error::LockActive),
+        "the gate flips at exactly `expiry_slot <= current_slot`, the same predicate \
+         prepare_counterparty_lien_create_delta and prepare_counterparty_lien_release_delta use"
+    );
 }

@@ -2804,15 +2804,27 @@ impl V16Core {
         Ok((bucket, source))
     }
 
+    /// C-S-10b: the `Fresh` status test alone is NOT freshness. A bucket keeps
+    /// `status == Fresh` after `expiry_slot` until something runs the expiry
+    /// transition, and on that lapsed bucket the provider used to withdraw
+    /// principal the expiry rule forfeits to the junior pool
+    /// (`prepare_counterparty_backing_expiry_delta`), while the entry above it
+    /// reads `credit_rate_num` on that same bucket — the inflation
+    /// `spec.md:342-357` forbids. Both siblings already test the lapse:
+    /// `prepare_counterparty_lien_create_delta` and
+    /// `prepare_counterparty_lien_release_delta` refuse on
+    /// `expiry_slot <= current_slot`. The gate below mirrors them.
     fn prepare_counterparty_backing_withdraw_delta(
         mut bucket: BackingBucketV16,
         mut source: SourceCreditStateV16,
+        current_slot: u64,
         amount: u128,
     ) -> V16Result<(BackingBucketV16, SourceCreditStateV16)> {
         if amount == 0 {
             return Ok((bucket, source));
         }
         if bucket.status != BackingBucketStatusV16::Fresh
+            || bucket.expiry_slot <= current_slot
             || bucket.fresh_unliened_backing_num < amount
             || source.fresh_reserved_backing_num < amount
         {
@@ -9148,6 +9160,7 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         let (bucket, source) = V16Core::prepare_counterparty_backing_withdraw_delta(
             self.backing_bucket_for_domain(domain)?,
             self.source_credit_for_domain(domain)?,
+            self.header.current_slot.get(),
             backing_num,
         )?;
         let (source, next_risk_epoch) = V16Core::prepare_source_credit_domain_recompute_for_epoch(
@@ -12263,9 +12276,10 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
     pub fn kani_prepare_counterparty_backing_withdraw_delta(
         bucket: BackingBucketV16,
         source: SourceCreditStateV16,
+        current_slot: u64,
         amount: u128,
     ) -> V16Result<(BackingBucketV16, SourceCreditStateV16)> {
-        V16Core::prepare_counterparty_backing_withdraw_delta(bucket, source, amount)
+        V16Core::prepare_counterparty_backing_withdraw_delta(bucket, source, current_slot, amount)
     }
 
     #[cfg(kani)]
