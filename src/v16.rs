@@ -17488,12 +17488,14 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             });
         }
         let domain_side = opposite_side(bankrupt_side);
-        // Defence in depth: every caller of this function already opens a close
-        // when the gross loss is non-zero, so a finalized-inert ledger is not
-        // reachable here today. Asking the same question as the sibling site keeps
-        // the two consistent if that ever changes. The capacity pre-flight stays on
-        // this branch so a residual with no bookable capacity still routes to
-        // recovery rather than erroring.
+        // A finalized-inert ledger IS reachable here (F-02, ledger half): a
+        // principal settlement that fully extinguishes the open ledger while the
+        // account still carries loss arrives through
+        // `advance_pending_close_residual_not_atomic`, which has no `begin` before
+        // this booking core. Asking the same question as the sibling site opens a
+        // fresh close for the loss that genuinely remains. The capacity pre-flight
+        // stays on this branch so a residual with no bookable capacity still routes
+        // to recovery rather than erroring.
         if account
             .header
             .close_progress
