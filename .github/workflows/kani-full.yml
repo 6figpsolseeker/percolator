@@ -31,6 +31,13 @@ name: Kani full census
 # suite is green at <sha>".
 
 on:
+  # TEMPORARY (H-4 runner proof, deleted with this branch): `schedule` and
+  # `workflow_dispatch` only fire from the DEFAULT branch, so this workflow cannot
+  # execute on a runner until it is merged. This push trigger exists on this
+  # throwaway branch only, to prove the census + shard plan + matrix fan-out on a
+  # real runner before the change lands.
+  push:
+    branches: ['fix/H-4-full']
   schedule:
     # 05:10 UTC nightly. Not on the hour: GitHub's scheduler queues heavily at :00.
     - cron: '10 5 * * *'
