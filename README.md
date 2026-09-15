@@ -272,7 +272,10 @@ cargo kani --tests --features fuzz
 # One harness (the fully-qualified name; --exact matches same-named harnesses across files)
 cargo kani --tests --features fuzz --jobs 1 --harness HARNESS_NAME
 
-# Long audits: one harness per process, with a 20-minute cap and a results TSV
+# Long audits: one harness per process, with a 20-minute cap and a results TSV.
+# Linux only: the per-harness cap is `timeout 1200` (scripts/run_kani_full_audit.sh:83),
+# a coreutils binary that macOS does not ship (`brew install coreutils` provides it as
+# `gtimeout`). The script is unchanged; run it on Linux, or expect it to abort there.
 bash scripts/run_kani_full_audit.sh
 ```
 
@@ -289,7 +292,7 @@ Counted at this checkout, not carried forward from a previous one:
 # Reproduce both numbers. Exclude comment lines: a `#[kani::proof]` written inside a doc
 # comment is not a harness (there are 3 such lines, e.g. tests/proofs_v17_fork.rs:1078).
 grep -rn '#\[kani::proof\]' --include='*.rs' . | grep -vE ':\s*//' | wc -l   # 328
-grep -rn '#\[kani::proof_for_contract' --include='*.rs' . | wc -l            # 0
+grep -rn '#\[kani::proof_for_contract' --include='*.rs' . | grep -vE ':\s*//' | wc -l  # 0
 ```
 
 `kani-list.json` is the machine-readable form of the same census and agrees: 328
