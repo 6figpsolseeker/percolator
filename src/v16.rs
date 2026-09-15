@@ -23663,11 +23663,17 @@ mod bankruptcy_hlock_clear_predicate_tests {
 
         // No genuine pending loss: no domain-loss barrier on either side.
         assert_eq!(
-            market.markets[0].engine.pending_domain_loss_barrier_long.get(),
+            market.markets[0]
+                .engine
+                .pending_domain_loss_barrier_long
+                .get(),
             0
         );
         assert_eq!(
-            market.markets[0].engine.pending_domain_loss_barrier_short.get(),
+            market.markets[0]
+                .engine
+                .pending_domain_loss_barrier_short
+                .get(),
             0
         );
 
