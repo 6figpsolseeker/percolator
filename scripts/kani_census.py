@@ -21,10 +21,12 @@ Subcommands
   check                  A == B, and |A| == kani-list.json totals; exit 1 on drift
   check-required FILE    every name in FILE (col 1) exists in the tree, exactly as
                          many times as column 2 of the shard file says (default 1)
-  shards N [COSTS] [HEAVY]
+  shards N [COSTS] [HEAVY] [EXCLUDED]
                          print a bin-packed shard assignment for the FULL census:
                          TSV of (shard, name, expected_count, cost_s). Names in
-                         HEAVY get a shard to themselves; the rest are LPT-packed
+                         HEAVY get a shard to themselves; names in EXCLUDED are
+                         assigned shard 0, which no matrix leg selects, so they are
+                         planned and counted but NOT RUN; the rest are LPT-packed
                          into the remaining shards using COSTS (default 120 s for
                          a name with no measured cost -- a new harness is included
                          automatically, which is the point of deriving this from
@@ -192,7 +194,17 @@ def cmd_check_required(root, listfile):
     return 0
 
 
-def cmd_shards(root, nshards, costs_file=None, heavy_file=None):
+def _read_name_list(path):
+    names = set()
+    if path and pathlib.Path(path).exists():
+        for raw in pathlib.Path(path).read_text().split("\n"):
+            line = raw.strip()
+            if line and not line.startswith("#"):
+                names.add(line.split("\t")[0])
+    return names
+
+
+def cmd_shards(root, nshards, costs_file=None, heavy_file=None, excluded_file=None):
     rows = census(root)
     counts = {}
     for r in rows:
@@ -210,19 +222,18 @@ def cmd_shards(root, nshards, costs_file=None, heavy_file=None):
                     costs[p[0]] = int(float(p[1]))
                 except ValueError:
                     pass
-    heavy = set()
-    if heavy_file and pathlib.Path(heavy_file).exists():
-        for raw in pathlib.Path(heavy_file).read_text().split("\n"):
-            line = raw.strip()
-            if line and not line.startswith("#"):
-                heavy.add(line.split("\t")[0])
+    heavy = _read_name_list(heavy_file)
+    excluded = _read_name_list(excluded_file)
 
     DEFAULT = 120
     names = sorted(counts)
-    heavy_names = [n for n in names if n in heavy]
-    rest = [n for n in names if n not in heavy]
+    # Shard 0 is never selected by a matrix leg: these are planned, counted against
+    # the census, and reported as NOT RUN — never as passes.
+    assign_zero = [n for n in names if n in excluded]
+    heavy_names = [n for n in names if n in heavy and n not in excluded]
+    rest = [n for n in names if n not in heavy and n not in excluded]
 
-    assign = {}
+    assign = {n: 0 for n in assign_zero}
     shard = 1
     for n in heavy_names:
         if shard > nshards:
@@ -231,10 +242,11 @@ def cmd_shards(root, nshards, costs_file=None, heavy_file=None):
         shard += 1
     first_general = shard
     if first_general > nshards:
-        # More heavy harnesses than shards: fall back to packing everything.
-        assign = {}
+        # More heavy harnesses than shards: fall back to packing everything except
+        # the excluded set (which must stay on shard 0 or it would kill a runner).
+        assign = {n: 0 for n in assign_zero}
         first_general = 1
-        rest = names
+        rest = [n for n in names if n not in excluded]
 
     load = {s: 0 for s in range(first_general, nshards + 1)}
     if not load:
@@ -267,13 +279,15 @@ def main(argv):
         return cmd_check_required(root, argv[2])
     if cmd == "shards":
         if len(argv) < 3:
-            print("usage: kani_census.py shards <n> [costs.tsv] [heavy.txt]", file=sys.stderr)
+            print("usage: kani_census.py shards <n> [costs.tsv] [heavy.txt] [excluded.tsv]",
+                  file=sys.stderr)
             return 2
         return cmd_shards(
             root,
             int(argv[2]),
             argv[3] if len(argv) > 3 else None,
             argv[4] if len(argv) > 4 else None,
+            argv[5] if len(argv) > 5 else None,
         )
     print(f"unknown subcommand: {cmd}", file=sys.stderr)
     return 2

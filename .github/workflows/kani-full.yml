@@ -68,6 +68,8 @@ jobs:
       shards: ${{ steps.plan.outputs.shards }}
       names: ${{ steps.plan.outputs.names }}
       census: ${{ steps.plan.outputs.census }}
+      to_run: ${{ steps.plan.outputs.to_run }}
+      not_run: ${{ steps.plan.outputs.not_run }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -85,7 +87,9 @@ jobs:
           fi
           mkdir -p kani-plan
           python3 scripts/kani_census.py shards "$N" \
-            .github/kani/full_costs.tsv .github/kani/heavy.txt > kani-plan/plan.tsv
+            .github/kani/full_costs.tsv \
+            .github/kani/heavy.txt \
+            .github/kani/hosted_runner_excluded.tsv > kani-plan/plan.tsv
           # The plan has one row per harness NAME; the census has one row per
           # harness DEFINITION. They differ, on purpose: one name in this tree is
           # defined twice and `--exact --harness` runs both definitions. Column 3 of
@@ -105,11 +109,21 @@ jobs:
             echo "::error::shard plan lists a harness name more than once"
             exit 1
           fi
+          # Shard 0 is the NOT-RUN bucket: harnesses measured to exceed a standard
+          # hosted runner. No matrix leg selects shard 0, so they are planned and
+          # counted against the census but never executed — and the report lists them
+          # as NOT RUN rather than letting them silently vanish from a "green sweep".
+          NOTRUN=$(awk -F'\t' '$1 == 0' kani-plan/plan.tsv | wc -l | tr -d ' ')
+          TORUN=$((NAMES - NOTRUN))
+          echo "not run on hosted runners: $NOTRUN; to run: $TORUN"
+          awk -F'\t' '$1 == 0 {print "  NOT RUN: " $2}' kani-plan/plan.tsv
           awk -F'\t' '{print $1}' kani-plan/plan.tsv | sort | uniq -c | sort -k2n
           LIST=$(seq 1 "$N" | paste -sd, - | sed 's/^/[/; s/$/]/')
           echo "shards=$LIST" >> "$GITHUB_OUTPUT"
           echo "names=$NAMES" >> "$GITHUB_OUTPUT"
           echo "census=$CENSUS" >> "$GITHUB_OUTPUT"
+          echo "to_run=$TORUN" >> "$GITHUB_OUTPUT"
+          echo "not_run=$NOTRUN" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v4
         with:
           name: kani-full-plan
@@ -208,7 +222,9 @@ jobs:
           # One TSV row per harness NAME (the shard script runs one `cargo kani`
           # per name); the census counts DEFINITIONS and is larger by the number of
           # duplicated names.
-          EXPECTED='${{ needs.plan.outputs.names }}'
+          EXPECTED='${{ needs.plan.outputs.to_run }}'
+          NAMES='${{ needs.plan.outputs.names }}'
+          NOTRUN='${{ needs.plan.outputs.not_run }}'
           CENSUS='${{ needs.plan.outputs.census }}'
           printf 'harness\tstatus\twall_s\trc\tverified\tfailures\ttotal\tcovers_sat\tcovers_total\tchecks_failed\tchecks_total\n' > kani_full_census.tsv
           find shards -name results.tsv -print0 \
@@ -227,7 +243,9 @@ jobs:
             echo ""
             echo "| | count |"
             echo "|---|---:|"
-            echo "| census (tree == kani-list.json) | **${CENSUS}** harnesses in **${EXPECTED}** names |"
+            echo "| census (tree == kani-list.json) | **${CENSUS}** harnesses in **${NAMES}** names |"
+            echo "| NOT RUN — exceeds a standard hosted runner (see .github/kani/hosted_runner_excluded.tsv) | ${NOTRUN} |"
+            echo "| planned to run | **${EXPECTED}** |"
             echo "| results collected | **${GOT}** |"
             echo "| SUCCESSFUL **with every declared cover satisfied** | **${OK}** |"
             echo "| SUCCESSFUL but **declares no cover** — EVIDENCE-FREE | ${NOCOVER} |"
@@ -236,7 +254,8 @@ jobs:
             echo "| failed / errored / count-mismatch | ${BAD} |"
             echo "| summed solver wall | ${WALL}s |"
             echo ""
-            echo "**Read the first two rows together.** Only the \`OK\` row is proof coverage."
+            echo "**Read the rows together.** Only the \`OK\` row is proof coverage: a NOT-RUN"
+            echo "harness is not a pass, and neither is a harness with no \`kani::cover!\`."
             echo "A harness with no \`kani::cover!\` reports \`VERIFICATION:- SUCCESSFUL\` while"
             echo "proving nothing, so it is listed here and never added to the pass count."
             if [ "${NOCOVER}" != "0" ] || [ "${PARTIAL}" != "0" ] || [ "${VACUOUS}" != "0" ]; then
@@ -265,7 +284,7 @@ jobs:
           # Assert the COUNT, not just the exit codes: a lost artefact or a shard that
           # selected nothing exits 0 and reports no rows.
           if [ "$GOT" -ne "$EXPECTED" ]; then
-            echo "::error::collected $GOT harness-name results but the plan declares $EXPECTED — a shard did not report"
+            echo "::error::collected $GOT harness-name results but the plan schedules $EXPECTED — a shard did not report"
             exit 1
           fi
           if [ "$BAD" != "0" ]; then

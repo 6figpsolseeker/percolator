@@ -173,12 +173,13 @@ jobs:
   # project came from people running harnesses by hand for hours.
   #
   # What is here now, and what it is NOT:
-  #   - `Kani shard N` (matrix): a CURATED REQUIRED SET, .github/kani/pr_required.tsv,
-  #     covering every kernel the 2026-09 fix loop touched (F-02, F-02 proofs, F-03,
-  #     F-04, I2, K, Q, Q2) plus the two harnesses repaired in #147 that this job has
-  #     always run. Each is run on its own with `--exact --harness`, never as a bare
-  #     `cargo kani` over the suite, and each must satisfy every cover property it
-  #     declares.
+  #   - `Kani shard 1..4` (matrix): a CURATED REQUIRED SET of 33 harnesses,
+  #     .github/kani/pr_required.tsv, covering every kernel the 2026-09 fix loop
+  #     touched (F-02, F-02 proofs, F-03, F-04, I2, K, Q, Q2) plus the two harnesses
+  #     repaired in #147 that this job has always run. Each is run on its own with
+  #     `--exact --harness`, never as a bare `cargo kani` over the suite, and each must
+  #     satisfy every cover property it declares. Measured on this runner: ~670 s of
+  #     solver per shard, ~13 min per job.
   #   - `Kani Proofs` (aggregator): the REQUIRED status context. It keeps that exact
   #     name because branch protection on main requires it; renaming it re-blocks every
   #     PR. It runs `if: always()` and fails when any shard did not succeed — a plain
@@ -195,18 +196,25 @@ jobs:
   #       331 are in that state today; they run in the scheduled tier and are reported
   #       there as EVIDENCE-FREE, and they are barred from this list by
   #       `kani_census.py check-required`), and
-  #   (3) it is cheap enough to keep a shard under ~20 minutes. The measured wall time
-  #       is a column of pr_required.tsv, and the excluded slow harnesses are listed at
-  #       the bottom of that file with the measurement that excluded them.
+  #   (3) it measured under ~5 minutes ON THIS RUNNER. Both wall columns of
+  #       pr_required.tsv are measurements, and the seven excluded harnesses are listed
+  #       at the bottom of that file each with the number that excluded it. Three of
+  #       those are in .github/kani/hosted_runner_excluded.tsv for a harder reason: they
+  #       do not merely run long, they KILL a standard hosted runner ("The runner has
+  #       received a shutdown signal"), taking the shard's results artefact with them.
   # ---------------------------------------------------------------------------
   kani-shard:
     name: Kani shard ${{ matrix.shard }}
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # 30, not 45: the measured shards are ~13 min, so a shard heading for 30 has hit a
+    # real regression and should say so quickly rather than hold a runner for an hour.
+    timeout-minutes: 30
     strategy:
+      # fail-fast: false so one bad harness does not hide the other shards' results —
+      # and because the aggregator needs every shard's TSV to assert the count.
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4, 5]
+        shard: [1, 2, 3, 4]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.93.1
@@ -298,7 +306,9 @@ jobs:
           RESULT='${{ needs.kani-shard.result }}'
           echo "kani-shard matrix result: $RESULT"
 
-          EXPECTED=$(grep -vc -e '^#' -e '^[[:space:]]*$' .github/kani/pr_required.tsv)
+          # `|| true`: grep -c exits 1 when the count is 0, which under `set -e` would
+          # kill the step with no message instead of reaching the count assertion below.
+          EXPECTED=$(grep -vc -e '^#' -e '^[[:space:]]*$' .github/kani/pr_required.tsv || true)
           echo "required harnesses declared: $EXPECTED"
 
           printf 'harness\tstatus\twall_s\trc\tverified\tfailures\ttotal\tcovers_sat\tcovers_total\tchecks_failed\tchecks_total\n' > all.tsv
