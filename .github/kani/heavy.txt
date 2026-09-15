@@ -12,12 +12,15 @@
 #
 # name                                                              solo wall (2026-08-24)
 proof_v16_terminal_realization_floored_rate_pays_zero_and_moves_nothing
-# ^ 1800 s: that run's own per-harness cap, recorded as TIMEOUT -- so 1800 s is a
-#   LOWER bound, not a measurement. It completed at 3710 s on a loaded box at
-#   22440ebb (SUCCESSFUL, 2 of 2 covers, 0 of 8010 checks failed).
+# ^ MEASURED ON A RUNNER: 410 s, SUCCESSFUL, 2 of 2 covers, 0 of 8181 checks failed
+#   (run 34944024488, job 104299114509). It keeps its own shard because the two
+#   pre-runner figures for it were both wrong in interesting ways: the 1800 s
+#   "solo" number was the 2026-08-24 run's TIMEOUT CAP (a lower bound that was never
+#   a measurement) and the 3710 s at 22440ebb was contention. 410 s is the real cost.
 proof_v16_expired_backing_yields_zero_realizable_support_after_expiry
-# ^ 799 s solo; 7093 s on the same loaded box. The single most expensive harness
-#   that actually finishes.
+# ^ 799 s solo; 7093 s on a loaded box. Also in hosted_runner_excluded.tsv: it KILLS
+#   a hosted runner, so the planner routes it to shard 0 and this entry never applies.
+#   Kept here so the entry survives a move to a larger runner.
 proof_v17_wide_mul_div_floor_stub_correct
 # ^ 736 s solo. Note the near-name trap: proof_v17_wide_mul_div_floor_postcondition_u16
 #   is written inside a DOC COMMENT in tests/proofs_v17_fork.rs and is not a harness

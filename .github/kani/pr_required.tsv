@@ -21,6 +21,16 @@
 #      never be required evidence. `scripts/kani_census.py check-required` rejects
 #      one outright, before Kani is even installed;
 #   3. measured under ~5 min on the runner, so a shard stays well inside its timeout.
+#      Run-to-run variance on a hosted runner is real and worth knowing before anyone
+#      treats 300 s as a hard line: the slowest row here,
+#      proof_v16_released_flat_pending_obligation_is_publicly_actionable, measured 276 s
+#      in run 34942808530 and 324 s in run 34944943956 — the same harness, the same
+#      commit-adjacent tree, 17 % apart. It is kept, and it is the first row to move to
+#      the scheduled tier if shard 1 ever runs long.
+#
+# Shard balance from run 34944943956 (all four shards green): 623 / 624 / 623 / 620 s of
+# solver, 8 / 9 / 8 / 8 harnesses, and 8m28s-12m58s of job wall including checkout, the
+# Kani install and the cache restore.
 #
 # "expected --exact matches" is 1 for every row here, and the runner asserts it.
 # It is not decoration: `cargo kani --exact --harness <name>` runs EVERY harness
@@ -33,39 +43,39 @@
 # wall columns from a real run. To rebalance, only column 1 changes.
 #
 # shard	harness	expect	fix	runner_s	local_s	covers
-1	proof_v16_bankruptcy_residual_capacity_is_nonzero_and_bounded_with_headroom	1	F-02	52	633	2/2
-1	proof_v16_counterparty_backing_withdraw_cannot_underback_claims	1	Q2	107	?	1/1
-1	proof_v16_full_drain_reset_then_prior_epoch_clear_is_total_and_exact	1	F-03	14	?	8/8
-1	proof_v16_kernel_settle_close_ledger_principal_rank_witness	1	F-02P	16	?	6/6
-1	proof_v16_public_terminal_insurance_retirement_requires_resolved_ready_accounts	1	I2	75	759	4/4
-1	proof_v16_released_flat_pending_obligation_is_publicly_actionable	1	F-04	276	?	4/4
-1	proof_v16_resolved_winddown_releases_liened_source_claim	1	Q	?	?	?
-1	proof_v17_lp_vault_cooldown_enforcement	1	CI	7	?	1/1
-2	proof_v16_counterparty_backing_expiry_reclassifies_principal_and_impairs_lien	1	F-04	13	?	4/4
-2	proof_v16_kernel_settle_close_ledger_principal_noop_arms_are_byte_identical	1	F-02P	15	139	6/6
-2	proof_v16_live_residual_booking_to_loss_bearing_side_is_bounded_and_exact	1	F-02	43	536	2/2
-2	proof_v16_live_source_backing_expiry_is_bounded_complete_and_isolated	1	F-04	7	?	6/6
-2	proof_v16_public_terminal_insurance_retirement_rejects_every_live_reservation_class	1	I2	275	?	4/4
-2	proof_v16_public_terminal_insurance_retirement_rejects_provider_earnings	1	I2	73	491	2/2
-2	proof_v16_resolved_winddown_releases_expired_liened_source_claim	1	Q	?	?	?
-2	proof_v16_terminal_slab_asset_step_is_total_and_priority_ordered	1	I2	4	?	5/5
-2	proof_v16_terminal_slab_wait_is_error_or_strict_cursor_progress	1	I2	?	?	?
+1	proof_v16_global_hlock_lane_selects_hmax_only_for_global_stress_or_candidate	1	F-03	16	?	5/5
+1	proof_v16_kernel_settle_close_ledger_principal_rank_witness	1	F-02P	18	?	6/6
+1	proof_v16_public_terminal_insurance_retirement_is_exact_and_fully_framed	1	I2	109	668	2/2
+1	proof_v16_public_terminal_insurance_retirement_rejects_account_capital	1	I2	61	?	2/2
+1	proof_v16_public_terminal_insurance_retirement_requires_resolved_ready_accounts	1	I2	80	759	4/4
+1	proof_v16_released_flat_pending_obligation_is_publicly_actionable	1	F-04	324	?	4/4
+1	proof_v16_resolved_winddown_releases_expired_liened_source_claim	1	Q	8	?	1/1
+1	proof_v16_terminal_slab_wait_is_error_or_strict_cursor_progress	1	I2	7	?	2/2
+2	proof_v16_counterparty_backing_withdraw_cannot_underback_claims	1	Q2	115	?	1/1
+2	proof_v16_counterparty_backing_withdraw_delta_debits_only_unliened_backing	1	Q2	37	?	2/2
+2	proof_v16_counterparty_backing_withdraw_delta_status_transitions_are_exact	1	Q2	6	?	10/10
+2	proof_v16_live_source_backing_expiry_is_bounded_complete_and_isolated	1	F-04	10	?	6/6
+2	proof_v16_negative_pnl_settlement_consumes_principal_before_residual	1	F-02	76	?	2/2
+2	proof_v16_positive_pnl_requires_full_source_claim_attribution	1	K	8	37	3/3
+2	proof_v16_public_terminal_insurance_retirement_rejects_every_live_reservation_class	1	I2	281	?	4/4
+2	proof_v16_public_terminal_insurance_retirement_rejects_provider_earnings	1	I2	84	491	2/2
+2	proof_v16_recovery_legs_cannot_starve_dispatchable_auto_crank_work	1	F-04	7	?	6/6
 3	proof_v16_asset_recovery_transition_freezes_price_and_bumps_once	1	CI	8	?	1/1
-3	proof_v16_counterparty_backing_withdraw_delta_status_transitions_are_exact	1	Q2	6	?	10/10
-3	proof_v16_global_hlock_lane_selects_hmax_only_for_global_stress_or_candidate	1	F-03	18	?	5/5
+3	proof_v16_counterparty_backing_expiry_reclassifies_principal_and_impairs_lien	1	F-04	16	?	4/4
 3	proof_v16_historical_bankruptcy_hlock_does_not_override_account_scope	1	F-03	77	519	3/3
-3	proof_v16_kernel_settle_close_ledger_principal_preserves_the_ledger_validator	1	F-02P	161	?	4/4
-3	proof_v16_public_terminal_insurance_retirement_rejects_account_capital	1	I2	58	?	2/2
-3	proof_v16_public_terminal_insurance_retirement_rejects_backing_principal	1	I2	95	?	2/2
-3	proof_v16_public_terminal_insurance_retirement_rejects_positive_source_claim	1	I2	238	?	2/2
-3	proof_v16_recovery_legs_cannot_starve_dispatchable_auto_crank_work	1	F-04	8	?	6/6
-4	proof_v16_close_progress_ledger_residual_equation_is_enforced	1	F-02	179	?	4/4
-4	proof_v16_counterparty_backing_withdraw_delta_debits_only_unliened_backing	1	Q2	34	?	2/2
-4	proof_v16_negative_pnl_settlement_consumes_principal_before_residual	1	F-02	61	?	2/2
-4	proof_v16_positive_pnl_requires_full_source_claim_attribution	1	K	6	37	3/3
-4	proof_v16_public_terminal_insurance_retirement_is_exact_and_fully_framed	1	I2	88	668	2/2
-4	proof_v16_released_flat_pending_obligation_detach_is_value_neutral_progress	1	F-04	223	1489	2/2
-4	proof_v16_resolved_residual_booking_without_loss_bearing_side_is_explicit_only	1	F-02	77	435	1/1
+3	proof_v16_kernel_settle_close_ledger_principal_preserves_the_ledger_validator	1	F-02P	150	?	4/4
+3	proof_v16_live_residual_booking_to_loss_bearing_side_is_bounded_and_exact	1	F-02	51	536	2/2
+3	proof_v16_released_flat_pending_obligation_detach_is_value_neutral_progress	1	F-04	228	1489	2/2
+3	proof_v16_resolved_residual_booking_without_loss_bearing_side_is_explicit_only	1	F-02	86	435	1/1
+3	proof_v17_lp_vault_cooldown_enforcement	1	CI	7	?	1/1
+4	proof_v16_bankruptcy_residual_capacity_is_nonzero_and_bounded_with_headroom	1	F-02	63	633	2/2
+4	proof_v16_close_progress_ledger_residual_equation_is_enforced	1	F-02	208	?	4/4
+4	proof_v16_full_drain_reset_then_prior_epoch_clear_is_total_and_exact	1	F-03	17	?	8/8
+4	proof_v16_kernel_settle_close_ledger_principal_noop_arms_are_byte_identical	1	F-02P	13	139	6/6
+4	proof_v16_public_terminal_insurance_retirement_rejects_backing_principal	1	I2	82	?	2/2
+4	proof_v16_public_terminal_insurance_retirement_rejects_positive_source_claim	1	I2	222	?	2/2
+4	proof_v16_resolved_winddown_releases_liened_source_claim	1	Q	8	?	1/1
+4	proof_v16_terminal_slab_asset_step_is_total_and_priority_ordered	1	I2	7	?	5/5
 #
 # -------------------------------------------------------------------------
 # DELIBERATELY EXCLUDED — named by the same fix dossiers, NOT run here.
@@ -86,14 +96,19 @@
 #   -> .github/kani/hosted_runner_excluded.tsv; verify it locally.
 #
 # proof_v16_expired_backing_yields_zero_realizable_support_after_expiry
-#   799 s solo (2026-08-24), 7093 s on a loaded box -- and the 2026-08-27 CI policy
-#   comment records a hosted runner being killed on exactly this harness.
-#   -> .github/kani/hosted_runner_excluded.tsv.
+#   KILLED THE RUNNER, measured twice. Here: run 34944024488, job 104299115485 (Full
+#   census shard 1), VM dead ~9 min in -- "The runner has received a shutdown signal".
+#   Independently confirms the 2026-08-27 CI policy comment ("a hosted runner was killed
+#   mid-check ... on a harness that measured 799s").
+#   -> .github/kani/hosted_runner_excluded.tsv; verify it locally.
 #
 # proof_v16_terminal_realization_floored_rate_pays_zero_and_moves_nothing
-#   1800 s solo -- and that was the 2026-08-24 run's per-harness TIMEOUT cap, so a lower
-#   bound rather than a measurement; 3710 s on a loaded box.
-#   -> .github/kani/hosted_runner_excluded.tsv.
+#   410 s on the runner (run 34944024488, job 104299114509, SUCCESSFUL, 2 of 2 covers,
+#   0 of 8181 checks failed) -- over the ~5-minute budget, but it does NOT kill a runner.
+#   Note the correction this measurement forced: the 1800 s figure recorded for this
+#   harness was the 2026-08-24 run's per-harness TIMEOUT CAP, i.e. a lower bound that
+#   was never a measurement, and the real hosted-runner cost is 4.4x smaller.
+#   Runs in the scheduled tier.
 #
 # proof_v16_public_counterparty_backing_withdraw_debits_vault_and_scaled_source_state
 #   410 s on the runner (run 34942808530, job 104295171177, SUCCESSFUL, 2 of 2 covers,

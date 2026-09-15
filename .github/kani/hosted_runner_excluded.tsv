@@ -1,28 +1,35 @@
-# Harnesses MEASURED to exceed a standard GitHub hosted runner (ubuntu-latest,
-# 4 vCPU / 16 GB). The shard planner assigns these to shard 0, which no matrix leg
-# selects: they are planned, counted against the census, and reported by the
-# `Kani full census` job as **NOT RUN**. They are never counted as passes.
+# Harnesses MEASURED to KILL a standard GitHub hosted runner (ubuntu-latest, 4 vCPU /
+# 16 GB). The shard planner assigns these to shard 0, which no matrix leg selects: they
+# are planned, counted against the census, and reported by `Kani full census` as
+# **NOT RUN**. They are never counted as passes.
 #
-# This list is not a convenience. The failure mode is not a timeout — the runner VM
-# dies and GitHub reports
+# This is not a "too slow" list — that is a budget question, and the slow-but-fine
+# harnesses live in .github/kani/pr_required.tsv's exclusion footer with their times.
+# This is a "the VM dies" list. GitHub reports
 #     ##[error]The runner has received a shutdown signal. This can happen when the
 #     runner service is stopped, or a manually started runner is canceled.
-# which is indistinguishable, from inside the job, from an infrastructure blip. A
-# sweep that hits one of these is red for a reason nobody can attribute, and a
-# permanently-red nightly is a nightly people learn to ignore. Naming them, with the
-# run that killed the runner, keeps the sweep's green meaningful and keeps the gap
-# visible instead of hiding it.
+# which, from inside the job, is indistinguishable from an infrastructure blip. Worse,
+# nothing after it runs: the step never returns, so even an `if: always()` artefact
+# upload is lost and the shard reports NOTHING rather than a failure. (That is exactly
+# what happened in run 34942808530 — 7 of 35 required harnesses vanished, and only the
+# aggregator's result-count assertion noticed.) A sweep that hits one of these is red
+# for a reason nobody can attribute, and a permanently-red nightly is a nightly people
+# learn to ignore. Naming them keeps the sweep's green meaningful and keeps the gap
+# visible.
 #
-# Removing a name from this list is the right move as soon as either (a) the harness
-# gets cheaper, or (b) the workflow moves to a larger runner. Raising the runner size
-# is a repo-settings / billing change, not a workflow change: `runs-on:
-# ubuntu-latest-8-cores` (or a self-hosted box) would very likely take all three.
+# A timeout cannot substitute for this list: the constraint is memory, not time. Both
+# harnesses below were killed while still well inside the job's time limit.
 #
-# Until then these three are verified LOCALLY, one at a time, with the same command
-# the workflow uses:
+# Removing a name from here is the right move as soon as either (a) the harness gets
+# cheaper, or (b) the workflow moves to a larger runner. Raising the runner size is a
+# repo-settings / billing change, not a workflow change: `runs-on:
+# ubuntu-latest-8-cores` (or a self-hosted box) would very likely take both.
+#
+# Until then these are verified LOCALLY, one at a time, with the same command the
+# workflow uses:
 #   cargo kani --tests --features fuzz --jobs 1 --exact --harness <name>
+# Both were SUCCESSFUL with all their covers satisfied when last run that way.
 #
 # name\tevidence
-proof_v16_retire_empty_asset_is_value_neutral_and_epoch_scoped	killed the runner 620 s into CBMC — run 34942808530, job 104295171244 (Kani shard 2), 2026-09-15T07:53:11Z, "The runner has received a shutdown signal"; 190 s solo on a 14-core box in 2026-08, 2461 s at 22440ebb under load, SUCCESSFUL with 1 of 1 covers both times
-proof_v16_expired_backing_yields_zero_realizable_support_after_expiry	the 2026-08-27 CI policy comment in .github/workflows/ci.yml recorded exactly this: "a hosted runner was killed mid-check ('The runner has received a shutdown signal') on a harness that measured 799s"; 799 s solo, 7093 s at 22440ebb under load, SUCCESSFUL with 2 of 2 covers
-proof_v16_terminal_realization_floored_rate_pays_zero_and_moves_nothing	1800 s solo — and that was the 2026-08-24 run's per-harness TIMEOUT cap, so a lower bound rather than a measurement; 3710 s at 22440ebb under load, SUCCESSFUL with 2 of 2 covers, 0 of 8010 checks failed
+proof_v16_retire_empty_asset_is_value_neutral_and_epoch_scoped	VM died 620 s into CBMC — run 34942808530, job 104295171244 (Kani shard 2), 2026-09-15T07:53:11Z, "The runner has received a shutdown signal", 13m46s into a job with a 45-minute limit. Locally: 190 s solo on a 14-core box in 2026-08, 2461 s at 22440ebb under load, SUCCESSFUL with 1 of 1 covers both times.
+proof_v16_expired_backing_yields_zero_realizable_support_after_expiry	VM died ~9 min in — run 34944024488, job 104299115485 (Full census shard 1), 2026-09-15T08:03:16Z, same message. Independently confirms the 2026-08-27 CI policy comment: "a hosted runner was killed mid-check ('The runner has received a shutdown signal') on a harness that measured 799s". Locally: 799 s solo, 7093 s at 22440ebb under load, SUCCESSFUL with 2 of 2 covers.
