@@ -3644,6 +3644,17 @@ pub fn kani_kernel_advance_close_ledger(
     )
 }
 
+/// Proof shim for the F-02 ledger-half kernel, mirroring
+/// `kani_kernel_advance_close_ledger` above. `kernel_settle_close_ledger_principal`
+/// is `pub(crate)`, so the out-of-crate proof file cannot call it directly.
+#[cfg(kani)]
+pub fn kani_kernel_settle_close_ledger_principal(
+    ledger: CloseProgressLedgerV16,
+    principal_paid: u128,
+) -> V16Result<CloseProgressLedgerV16> {
+    V16Core::kernel_settle_close_ledger_principal(ledger, principal_paid)
+}
+
 #[cfg(kani)]
 pub fn kani_kernel_advance_leg_b_snap(
     leg: PortfolioLegV16,

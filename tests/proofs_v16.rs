@@ -17,7 +17,8 @@ use percolator::v16::{
     kani_health_cert_after_capital_debit, kani_health_requirements_from_base_and_target_lag,
     kani_insert_account_kf_settlement_plan_entry, kani_kernel_accumulate_batch_trade,
     kani_kernel_advance_close_ledger, kani_kernel_advance_leg_b_snap,
-    kani_kernel_initial_margin_gate, kani_kernel_locked_margin_gate, kani_kernel_settle_principal,
+    kani_kernel_initial_margin_gate, kani_kernel_locked_margin_gate,
+    kani_kernel_settle_close_ledger_principal, kani_kernel_settle_principal,
     kani_liquidation_close_would_leave_uncovered_loss_with_open_risk,
     kani_liquidation_engine_close_request_q, kani_liquidation_fee_from_raw_fee,
     kani_liquidation_partial_search_hi, kani_liquidation_projected_healthy_after_close,
@@ -19062,6 +19063,365 @@ fn proof_v16_kernel_advance_close_ledger_rank_witness() {
         assert_eq!(l.active, ledger.active);
         assert_eq!(l.canceled, ledger.canceled);
     }
+}
+
+// ---------------------------------------------------------------------------
+// F-02 (ledger half): the harness family for the PRODUCTION KERNEL
+// `V16Core::kernel_settle_close_ledger_principal` (`src/v16.rs:1144`), which
+// credits a mid-close PRINCIPAL settlement to the open close ledger.
+//
+// Fork-only: `av` 8eb7142a has no such kernel (`git show av:src/v16.rs | grep -c
+// kernel_settle_close_ledger_principal` -> 0, and none of the 111 `av/*`
+// branches carries it), so there is no upstream harness to carry over. These
+// follow the house style of the sibling `proof_v16_kernel_advance_close_ledger_
+// rank_witness` above: a symbolic ledger, `kani::assume` on exactly what the
+// ledger validator enforces, exact postconditions, and a named cover per branch.
+// ---------------------------------------------------------------------------
+
+/// A fully symbolic `CloseProgressLedgerV16`, field for field — the sibling
+/// `proof_v16_kernel_advance_close_ledger_rank_witness` inlines the identical
+/// literal.
+fn symbolic_close_progress_ledger() -> CloseProgressLedgerV16 {
+    CloseProgressLedgerV16 {
+        active: kani::any(),
+        finalized: kani::any(),
+        canceled: kani::any(),
+        close_id: kani::any(),
+        asset_index: kani::any(),
+        market_id: kani::any(),
+        domain_side: if kani::any() {
+            SideV16::Long
+        } else {
+            SideV16::Short
+        },
+        gross_loss_at_close_start: kani::any(),
+        drift_reference_slot: kani::any(),
+        max_close_slot: kani::any(),
+        support_consumed: kani::any(),
+        junior_face_burned: kani::any(),
+        insurance_spent: kani::any(),
+        b_loss_booked: kani::any(),
+        explicit_loss_assigned: kani::any(),
+        quantity_adl_applied_q: kani::any(),
+        drift_consumed: kani::any(),
+        residual_remaining: kani::any(),
+    }
+}
+
+/// The precondition every caller of the kernel is under: the ledger came out of
+/// `validate_close_progress_ledger_with_market` (`src/v16.rs:5397`). Each
+/// `assume` below is one clause of that validator, restricted to the fields the
+/// kernel reads or writes:
+///
+/// * `progress <= gross + drift` and `residual_remaining == gross + drift -
+///   progress` — the residual identity. It holds in EVERY state the validator
+///   accepts, not only the active one: a canceled ledger must have
+///   `!has_irreversible_progress()` (so `progress == 0` and `drift == 0`) and
+///   `residual == gross`; an inactive one must be `is_empty()`.
+/// * `finalized => residual_remaining == 0`.
+/// * `quantity_adl_applied_q != 0 => finalized && residual_remaining == 0`.
+/// * `support_consumed <= junior_face_burned`.
+///
+/// The `< 1 << 64` amount bounds are the production-guaranteed ones the sibling
+/// rank witness assumes (`MAX_VAULT_TVL` and every amount derived from it are
+/// far below `2^64`); they exist so the 128-bit adds in the postconditions
+/// below cannot themselves overflow.
+fn assume_validated_close_progress_ledger(ledger: CloseProgressLedgerV16) {
+    kani::assume(ledger.gross_loss_at_close_start < 1u128 << 64);
+    kani::assume(ledger.drift_consumed < 1u128 << 64);
+    kani::assume(ledger.support_consumed < 1u128 << 64);
+    kani::assume(ledger.insurance_spent < 1u128 << 64);
+    kani::assume(ledger.b_loss_booked < 1u128 << 64);
+    kani::assume(ledger.explicit_loss_assigned < 1u128 << 64);
+    let total_loss = ledger.gross_loss_at_close_start + ledger.drift_consumed;
+    let progress = ledger.support_consumed
+        + ledger.insurance_spent
+        + ledger.b_loss_booked
+        + ledger.explicit_loss_assigned;
+    kani::assume(progress <= total_loss);
+    kani::assume(ledger.residual_remaining == total_loss - progress);
+    kani::assume(!ledger.finalized || ledger.residual_remaining == 0);
+    kani::assume(
+        ledger.quantity_adl_applied_q == 0 || (ledger.finalized && ledger.residual_remaining == 0),
+    );
+    kani::assume(ledger.support_consumed <= ledger.junior_face_burned);
+}
+
+/// F-02 property (a): every no-op arm of `kernel_settle_close_ledger_principal`
+/// returns the ledger BYTE-IDENTICAL — asserted both on the runtime struct and
+/// on its POD encoding — and no no-op arm can set `finalized`.
+///
+/// The five arms are `principal_paid == 0`, `!active`, `finalized`, `canceled`,
+/// and `cured == 0` (a payment against nothing outstanding, or against a gross
+/// that is already fully credited).
+#[kani::proof]
+#[kani::unwind(8)]
+#[kani::solver(cadical)]
+fn proof_v16_kernel_settle_close_ledger_principal_noop_arms_are_byte_identical() {
+    let ledger = symbolic_close_progress_ledger();
+    let principal_paid: u128 = kani::any();
+    assume_validated_close_progress_ledger(ledger);
+
+    let open = ledger.active && !ledger.finalized && !ledger.canceled;
+    let outstanding = ledger.residual_remaining;
+    let cured = if open {
+        principal_paid
+            .min(outstanding)
+            .min(ledger.gross_loss_at_close_start)
+    } else {
+        0
+    };
+
+    let result = kani_kernel_settle_close_ledger_principal(ledger, principal_paid);
+    assert!(result.is_ok());
+    let out = result.unwrap();
+
+    kani::cover!(
+        principal_paid == 0 && open,
+        "no-op arm: zero payment on an open ledger"
+    );
+    kani::cover!(
+        principal_paid > 0 && !ledger.active,
+        "no-op arm: an inactive ledger"
+    );
+    kani::cover!(
+        principal_paid > 0 && ledger.active && ledger.finalized && !ledger.canceled,
+        "no-op arm: an already-finalized ledger"
+    );
+    kani::cover!(
+        principal_paid > 0 && ledger.canceled,
+        "no-op arm: a canceled ledger"
+    );
+    kani::cover!(
+        principal_paid > 0 && open && outstanding == 0,
+        "no-op arm: payment beyond nothing outstanding"
+    );
+    kani::cover!(
+        principal_paid > 0 && open && outstanding > 0 && ledger.gross_loss_at_close_start == 0,
+        "no-op arm: the gross is already fully credited, so nothing can be cured"
+    );
+
+    if cured == 0 {
+        // field-for-field identity (the derived `PartialEq` compares all 18)
+        assert_eq!(out, ledger);
+        // ... and identity through the POD encoding the account actually stores,
+        // so the no-op cannot move a byte of `close_progress` either
+        assert_eq!(
+            CloseProgressLedgerV16Account::from_runtime(&out).try_to_runtime(),
+            Ok(ledger)
+        );
+        // stated separately so a change that stops freezing `finalized` fails HERE
+        assert_eq!(out.finalized, ledger.finalized);
+    }
+}
+
+/// F-02 properties (b), (c), (d), (e) for
+/// `kernel_settle_close_ledger_principal`, in the shape of the sibling
+/// `proof_v16_kernel_advance_close_ledger_rank_witness`:
+///
+/// * (b) the credit is clamped — `cured <= principal_paid`, `cured <=
+///   outstanding_before`, `cured <= gross_before`; the gross never underflows;
+///   `residual_remaining` never goes negative. Every fail-closed path is
+///   UNREACHABLE on a validated ledger, which is what `assert!(result.is_ok())`
+///   proves — including the SECOND `progress > total_loss` check, which cannot
+///   fire once the first passes because `cured <= outstanding = total_loss -
+///   progress` gives `total_loss - cured >= progress`.
+/// * (c) the residual equation is exact after the credit, and every progress
+///   field plus `drift_consumed`, `asset_index`, `domain_side`, `active` and
+///   `canceled` is frozen.
+/// * (d) on the crediting path `finalized <=> residual_remaining == 0`; on a
+///   no-op path `finalized` is exactly what it was.
+/// * (e) THE RANK: `residual_remaining` never rises, and the drop is exactly
+///   `cured` — so a sequence of principal settlements terminates.
+#[kani::proof]
+#[kani::unwind(8)]
+#[kani::solver(cadical)]
+fn proof_v16_kernel_settle_close_ledger_principal_rank_witness() {
+    let ledger = symbolic_close_progress_ledger();
+    let principal_paid: u128 = kani::any();
+    assume_validated_close_progress_ledger(ledger);
+
+    let open = ledger.active && !ledger.finalized && !ledger.canceled;
+    let gross_before = ledger.gross_loss_at_close_start;
+    let outstanding_before = ledger.residual_remaining;
+    let cured = if open {
+        principal_paid.min(outstanding_before).min(gross_before)
+    } else {
+        0
+    };
+
+    let result = kani_kernel_settle_close_ledger_principal(ledger, principal_paid);
+    // fails-closed is unreachable on a validated ledger: both `progress >
+    // total_loss` checks and all four `checked_*` calls
+    assert!(result.is_ok());
+    let out = result.unwrap();
+
+    kani::cover!(
+        cured > 0 && out.residual_remaining > 0,
+        "a partial cure lowers the residual and leaves the close pending"
+    );
+    kani::cover!(
+        cured > 0 && out.residual_remaining == 0 && out.finalized,
+        "a cure that extinguishes the residual finalizes the close (the F-02 un-brick)"
+    );
+    kani::cover!(
+        cured > 0 && principal_paid > outstanding_before,
+        "a payment larger than the outstanding residual is clamped to it"
+    );
+    kani::cover!(
+        cured > 0 && cured == gross_before && gross_before < outstanding_before,
+        "the gross clamp is the binding one (drift_consumed exceeds booked progress)"
+    );
+    kani::cover!(
+        cured == 0 && open,
+        "an open ledger with nothing to cure is a no-op"
+    );
+    kani::cover!(!open && principal_paid > 0, "a closed ledger is a no-op");
+
+    // (b) the clamp, and the gross moves by exactly the credit without underflow
+    assert!(cured <= principal_paid);
+    assert!(cured <= outstanding_before);
+    assert!(cured <= gross_before);
+    assert_eq!(out.gross_loss_at_close_start, gross_before - cured);
+    assert!(out.gross_loss_at_close_start <= gross_before);
+
+    // (e) THE RANK: the residual falls by exactly the credit and never rises
+    assert_eq!(out.residual_remaining, outstanding_before - cured);
+    assert!(out.residual_remaining <= outstanding_before);
+    assert_eq!(outstanding_before - out.residual_remaining, cured);
+
+    // (c) the equation, recomputed from the RESULT's own fields
+    let progress_after =
+        out.support_consumed + out.insurance_spent + out.b_loss_booked + out.explicit_loss_assigned;
+    let total_after = out.gross_loss_at_close_start + out.drift_consumed;
+    assert!(progress_after <= total_after);
+    assert_eq!(out.residual_remaining, total_after - progress_after);
+
+    // (c) nothing else moves: no progress category, no drift, no identity field
+    assert_eq!(out.support_consumed, ledger.support_consumed);
+    assert_eq!(out.insurance_spent, ledger.insurance_spent);
+    assert_eq!(out.b_loss_booked, ledger.b_loss_booked);
+    assert_eq!(out.explicit_loss_assigned, ledger.explicit_loss_assigned);
+    assert_eq!(out.junior_face_burned, ledger.junior_face_burned);
+    assert_eq!(out.quantity_adl_applied_q, ledger.quantity_adl_applied_q);
+    assert_eq!(out.drift_consumed, ledger.drift_consumed);
+    assert_eq!(out.asset_index, ledger.asset_index);
+    assert_eq!(out.domain_side, ledger.domain_side);
+    assert_eq!(out.market_id, ledger.market_id);
+    assert_eq!(out.close_id, ledger.close_id);
+    assert_eq!(out.drift_reference_slot, ledger.drift_reference_slot);
+    assert_eq!(out.max_close_slot, ledger.max_close_slot);
+    assert_eq!(out.active, ledger.active);
+    assert_eq!(out.canceled, ledger.canceled);
+
+    // (d) finalization is exactly "the residual reached zero" on the crediting
+    // path, and is never set on a no-op path
+    if cured > 0 {
+        assert_eq!(out.finalized, out.residual_remaining == 0);
+    } else {
+        assert_eq!(out.finalized, ledger.finalized);
+    }
+}
+
+/// F-02 property (f): the kernel never produces a ledger the account validator
+/// rejects. The ledger goes through the real
+/// `PortfolioV16ViewMut::validate_with_market` before AND after the credit, on
+/// the same one-market fixture `proof_v16_close_progress_ledger_residual_
+/// equation_is_enforced` uses, so the round trip exercises the POD encode /
+/// decode as well as the value rules.
+///
+/// It also pins the liveness half of F-02: a close the payment fully cures ends
+/// `active && finalized && !canceled && residual_remaining == 0` — exactly
+/// `is_finalized_inert()` (`src/v16.rs:5687`), the state `close_slot_available()`
+/// accepts, which is what lets the NEXT bankruptcy close open instead of hitting
+/// the route-1c brick.
+#[kani::proof]
+#[kani::unwind(48)]
+#[kani::solver(cadical)]
+fn proof_v16_kernel_settle_close_ledger_principal_preserves_the_ledger_validator() {
+    let gross_raw: u8 = kani::any();
+    let drift_raw: u8 = kani::any();
+    let support_raw: u8 = kani::any();
+    let insurance_raw: u8 = kani::any();
+    let b_loss_raw: u8 = kani::any();
+    let explicit_raw: u8 = kani::any();
+    let paid_raw: u8 = kani::any();
+
+    let gross = gross_raw as u128;
+    let drift = drift_raw as u128;
+    let support = support_raw as u128;
+    let insurance = insurance_raw as u128;
+    let b_loss = b_loss_raw as u128;
+    let explicit = explicit_raw as u128;
+    let paid = paid_raw as u128;
+
+    let total_loss = gross + drift;
+    let progress = support + insurance + b_loss + explicit;
+    kani::assume(progress <= total_loss);
+    let residual = total_loss - progress;
+
+    let (mut header, mut markets, mut account_header) = one_market_view_fixture();
+    let base = CloseProgressLedgerV16 {
+        active: true,
+        finalized: residual == 0,
+        canceled: false,
+        close_id: 1,
+        asset_index: 0,
+        market_id: 1,
+        domain_side: SideV16::Long,
+        gross_loss_at_close_start: gross,
+        drift_reference_slot: 0,
+        max_close_slot: 10,
+        support_consumed: support,
+        junior_face_burned: support,
+        insurance_spent: insurance,
+        b_loss_booked: b_loss,
+        explicit_loss_assigned: explicit,
+        drift_consumed: drift,
+        residual_remaining: residual,
+        ..CloseProgressLedgerV16::EMPTY
+    };
+    let market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    account_header.close_progress = CloseProgressLedgerV16Account::from_runtime(&base);
+    let before_ok = {
+        let account = PortfolioV16ViewMut::new(&mut account_header);
+        account.validate_with_market(&market.as_view())
+    };
+
+    let result = kani_kernel_settle_close_ledger_principal(base, paid);
+    assert!(result.is_ok());
+    let after = result.unwrap();
+
+    let mut after_header = account_header;
+    after_header.close_progress = CloseProgressLedgerV16Account::from_runtime(&after);
+    let after_ok = {
+        let after_account = PortfolioV16ViewMut::new(&mut after_header);
+        after_account.validate_with_market(&market.as_view())
+    };
+
+    kani::cover!(
+        residual > 0 && after.residual_remaining > 0 && after.residual_remaining < residual,
+        "validator accepts a partially cured, still-pending ledger"
+    );
+    kani::cover!(
+        residual > 0 && after.residual_remaining == 0 && after.finalized,
+        "validator accepts the fully cured ledger, which is finalized-inert"
+    );
+    kani::cover!(
+        residual == 0,
+        "an already-finalized ledger is passed through unchanged"
+    );
+    kani::cover!(
+        residual > 0 && paid == 0,
+        "a zero payment leaves a pending ledger pending"
+    );
+
+    assert_eq!(before_ok, Ok(()));
+    assert_eq!(after_ok, Ok(()));
+    // finalization is exact on this fixture (`base.finalized == (residual == 0)`)
+    assert_eq!(after.finalized, after.residual_remaining == 0);
+    // ... so a fully cured close is FINALIZED-INERT, not a pending brick
+    assert!(after.residual_remaining != 0 || (after.active && after.finalized && !after.canceled));
 }
 
 // Upstream dffa10de `contract_check_kernel_advance_leg_b_snap`, carried under

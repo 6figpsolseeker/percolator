@@ -97,6 +97,9 @@
       "proof_v16_kernel_advance_leg_b_snap_rank_witness",
       "proof_v16_kernel_initial_margin_gate_exact_decision",
       "proof_v16_kernel_locked_margin_gate_no_positive_credit",
+      "proof_v16_kernel_settle_close_ledger_principal_noop_arms_are_byte_identical",
+      "proof_v16_kernel_settle_close_ledger_principal_preserves_the_ledger_validator",
+      "proof_v16_kernel_settle_close_ledger_principal_rank_witness",
       "proof_v16_kernel_settle_principal_exact_paid_and_conservation",
       "proof_v16_kf_accrual_marks_each_stored_cohort_exactly_once",
       "proof_v16_kf_settlement_disposes_one_cohort_member_without_underflow",
@@ -342,7 +345,7 @@
   "contract-harnesses": {},
   "contracts": [],
   "totals": {
-    "standard-harnesses": 328,
+    "standard-harnesses": 331,
     "contract-harnesses": 0,
     "functions-under-contract": 0
   }
