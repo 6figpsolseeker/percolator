@@ -1,6 +1,44 @@
 #!/usr/bin/env bash
 # Full Kani audit: run all proofs one-by-one with 20-minute timeout each.
 set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# Kani version pin (2026-09-15).
+#
+# This script writes a results TSV that gets cited as evidence. A results table
+# that does not name its verifier version cannot be reproduced, and the things
+# that move between Kani releases are exactly the things the table reports:
+# which unstable flags a harness needs to compile at all, the JSON schema of
+# `kani-list.json` (checked in at the repo root, regenerated with 0.67.0), and
+# therefore the harness count itself. Checking the version here, before anything
+# runs, is cheaper than discovering the mismatch in a merged claim.
+#
+# `cargo kani --version` prints e.g. "cargo-kani 0.67.0".
+# ---------------------------------------------------------------------------
+KANI_VERSION_REQUIRED="0.67.0"
+if ! command -v cargo-kani > /dev/null 2>&1 && ! cargo kani --version > /dev/null 2>&1; then
+    echo "ERROR: Kani is not installed." >&2
+    echo "       This repo is pinned to Kani ${KANI_VERSION_REQUIRED}. Install it with:" >&2
+    echo "         cargo install --locked kani-verifier@${KANI_VERSION_REQUIRED} && cargo kani setup" >&2
+    exit 1
+fi
+KANI_VERSION_ACTUAL="$(cargo kani --version 2>/dev/null | awk '{print $NF}')"
+if [ "${KANI_VERSION_ACTUAL}" != "${KANI_VERSION_REQUIRED}" ]; then
+    echo "ERROR: Kani version mismatch." >&2
+    echo "       required: ${KANI_VERSION_REQUIRED}" >&2
+    echo "       found:    ${KANI_VERSION_ACTUAL:-<could not parse \`cargo kani --version\`>}" >&2
+    echo "" >&2
+    echo "       The results TSV this script writes is cited as evidence, and harness" >&2
+    echo "       counts, required unstable flags, and the kani-list.json schema all move" >&2
+    echo "       between Kani releases. Re-pin deliberately, or install the pinned version:" >&2
+    echo "         cargo install --locked kani-verifier@${KANI_VERSION_REQUIRED} && cargo kani setup" >&2
+    echo "" >&2
+    echo "       If you are intentionally re-pinning, update KANI_VERSION_REQUIRED here AND" >&2
+    echo "       the Kani section of README.md, and regenerate kani-list.json." >&2
+    exit 1
+fi
+echo "Kani ${KANI_VERSION_ACTUAL} (pinned)"
+
 cd /home/anatoly/percolator
 
 OUTFILE="/home/anatoly/percolator/kani_audit_full.tsv"

@@ -42,6 +42,59 @@ jobs:
       - name: Test
         run: cargo test --no-fail-fast --verbose
 
+  audit-scan:
+    name: audit-scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    # Added 2026-09-15 (H-2). The `test` job above runs the DEFAULT feature set, in which
+    # the O(N) audit-scan invariants do not exist: `validate_shape_full_audit_scan`
+    # (src/v16.rs:8318) is `#[cfg(any(test, kani, feature = "audit-scan"))]`, and an
+    # integration test builds the lib as a DEPENDENCY, so cfg(test) is not set on the lib
+    # and the scan compiles out. `validate_shape_audit_scan` (:8610-8619) is then a no-op
+    # returning Ok(()). That is why `cargo test --test v16_spec_tests` reported 180/0 while
+    # `--features audit-scan` reported 172/8: eight fixtures had been merged green, over
+    # five separate PRs, in a build that never ran the checks they broke.
+    #
+    # Nothing at 2c38570a ran this feature — no workflow, script, Makefile or justfile —
+    # so the split the in-tree tripwire module warns about in its own doc
+    # (src/v16.rs:23902-23913: "a state the default build commits and the audit build
+    # rejects — a split invisible to anyone not running the audit feature") had no gate at
+    # all. This job is that gate. It is deliberately a SEPARATE job rather than an extra
+    # step on `test`: the job names above are required status contexts on main and must not
+    # move, and a second job also keeps the two builds' caches and failures distinct.
+    #
+    # This job is NOT yet a required context in branch protection; adding it there is a
+    # repo-settings change, not a workflow one.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.93.1
+      - uses: Swatinem/rust-cache@v2
+      # WIDENED 2026-09-15 (AS-03), from `--test v16_spec_tests` + `--lib` to --all-targets.
+      #
+      # The original two steps were scoped for a measured reason, recorded when this job was
+      # added: `cargo test --features audit-scan --no-fail-fast` across every target was NOT
+      # green — tests/grief_econ_final.rs was 5 passed / 2 failed (7/0 by default), so
+      # --all-targets would have landed this job red on day one. That failure is now fixed:
+      # its `drain_only_holdout` fixture hand-wrote a one-sided residual OI (oi_eff_long_q =
+      # oi, oi_eff_short_q = 0) on an Active asset in a Live market, which the matched-book
+      # conjunct at src/v16.rs:8501-8503 rejects, and never mirrored the slot's
+      # resolved_payout_blocker_count into the header total (:8331-8332). Both are fixture
+      # drift, repaired in tests/ only.
+      #
+      # Measured before widening, on this commit: `cargo test --features audit-scan
+      # --no-fail-fast --all-targets` is green on every target — lib 67, backing_double_claim_fuzz
+      # 13, deposit_live_only_448 4, grief_econ_final 7, lp_burn_repro 36,
+      # no_seniority_bypass_143 3, resolved_insolvent_fuzz 2, v16_spec_tests 179 (180 minus the
+      # one test cfg-gated out of this build), and 0-test proof/fuzz targets. Widening is what
+      # makes the gate cover the whole tree rather than the one suite that happened to be
+      # triaged; a new red target still names itself in the output, so failures stay
+      # attributable.
+      #
+      # --all-targets excludes doc-tests; this crate has none (`Doc-tests percolator` reports
+      # 0 passed), so nothing is dropped by not running them here.
+      - name: All targets under --features audit-scan
+        run: cargo test --features audit-scan --no-fail-fast --verbose --all-targets
+
   clippy:
     name: clippy
     runs-on: ubuntu-latest

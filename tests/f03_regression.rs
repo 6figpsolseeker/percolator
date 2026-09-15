@@ -432,8 +432,30 @@ fn f03_c_a_realized_write_off_atom_no_longer_latches_the_hlock() {
     // And the gate is not neutered: a genuine `pending_domain_loss_barrier_*` still
     // holds the hlock. Raise one by hand (a state edit, not a source edit), re-latch,
     // and the identical crank must refuse to clear.
+    //
+    // AS-05: the barrier is NOT a free-standing byte. It is one of the six terms
+    // `slot_resolved_payout_blockers_v16` (v16.rs:7541-7551) sums for a slot, and the
+    // only engine writer, `set_pending_domain_loss_barrier_count` (v16.rs:17018-17043),
+    // pairs the slot write (:17039) with `update_resolved_payout_blocker_total`
+    // (:17035 -> :8825-8832) inside the same call — barrier and header total always move
+    // together. That fn is private, so the pairing is mirrored here exactly as it would
+    // write it, in both directions. Without the mirror the audit build sees
+    // `scan=1 hdr=0` at the header-aggregate conjunct in `validate_shape_full_audit_scan`
+    // (v16.rs:8415-8416), which is `#[cfg(any(test, kani, feature = "audit-scan"))]`:
+    // `validate_shape` then returns `InvalidConfig` and the crank below fails before it
+    // can decide anything about the hlock, while the default build — which never runs
+    // that conjunct — passes. The subject of this block (a real barrier holds the byte)
+    // is unchanged; only the bookkeeping the raw write bypassed is restored.
+    let blockers_before = w.header.resolved_payout_blocker_count.get();
     w.header.bankruptcy_hlock_active = 1;
     w.markets[0].engine.pending_domain_loss_barrier_long = V16PodU64::new(1);
+    w.header.resolved_payout_blocker_count = V16PodU64::new(blockers_before + 1);
+    {
+        let market = MarketGroupV16ViewMut::new(&mut w.header, &mut w.markets);
+        market
+            .validate_shape()
+            .expect("the planted barrier must leave the group on-model for the audit scan");
+    }
     let mut a = core::mem::take(&mut w.longs[1]);
     w.crank_refresh(&mut a, 5);
     w.longs[1] = a;
@@ -443,6 +465,7 @@ fn f03_c_a_realized_write_off_atom_no_longer_latches_the_hlock() {
         "a genuine pending domain-loss barrier must still hold the hlock"
     );
     w.markets[0].engine.pending_domain_loss_barrier_long = V16PodU64::new(0);
+    w.header.resolved_payout_blocker_count = V16PodU64::new(blockers_before);
 }
 
 // ------------------------------------------------------------------- (d) ----
