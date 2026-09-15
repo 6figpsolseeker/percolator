@@ -5103,7 +5103,14 @@ impl<'a> PortfolioV16View<'a> {
         if source_claim_sum_num != 0 {
             let source_attributed_pnl =
                 if decode_market_mode(market.header.mode)? == MarketModeV16::Resolved {
-                    pnl.max(0) as u128 - self.header.reserved_pnl.get()
+                    // Guarded ~13 lines above, but keep the guard local to the use:
+                    // a wrapped value here does not make
+                    // `validate_positive_pnl_source_attribution` wrong, it makes it
+                    // disappear (`u128::MAX as i128 == -1` hits its `pnl <= 0` early
+                    // return), silently dropping the source-domain realizability cap.
+                    (pnl.max(0) as u128)
+                        .checked_sub(self.header.reserved_pnl.get())
+                        .ok_or(V16Error::CounterUnderflow)?
                 } else {
                     pnl.max(0) as u128
                 };
