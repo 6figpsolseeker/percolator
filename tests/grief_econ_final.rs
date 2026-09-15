@@ -90,14 +90,42 @@ fn drain_only_holdout(
     asset.raw_oracle_target_price = PRICE;
     asset.fund_px_last = PRICE;
     asset.slot_last = 100;
-    // Residual long exposure, under-backed => DrainOnly (engine sets this at
-    // src/v16.rs:12548 when `oi_eff_long_q != 0 && a_long < MIN_A_SIDE`).
+    // Residual exposure, under-backed => the side goes DrainOnly. The engine sets
+    // that mode inside `reduce_matching_open_interest_for_unilateral_close`
+    // (2c38570a:src/v16.rs:17530), at :17565-17567 for the long side, when
+    // `opp_oi_after != 0 && a_long < MIN_A_SIDE`.
+    //
+    // MATCHED BOOK, not a one-sided residue. That same function subtracts the SAME
+    // `close_q` from the opposite side (:17548 `opp_oi_after = opp_oi_before -
+    // close_q`, written at :17563 / :17570), so a unilateral close leaves
+    // `oi_eff_long_q == oi_eff_short_q`. A Live market whose asset is not in
+    // Recovery is held to exactly that by the audit-scan conjunct at
+    // 2c38570a:src/v16.rs:8501-8503, whose own doc comment (:8482-8483) gives the
+    // reason: "The Live matched-book invariant (oi_eff_long == oi_eff_short) holds
+    // for a normally-trading asset (Active/DrainOnly always reduce matched pairs)."
+    // Writing the long side alone built a state no engine transition can reach:
+    // under `--features audit-scan` `validate_shape` rejected this fixture with
+    // InvalidConfig before either asserting test reached its subject (AS-03).
     asset.oi_eff_long_q = oi;
     asset.loss_weight_sum_long = oi;
     asset.stored_pos_count_long = 1;
     asset.a_long = ADL_ONE;
     asset.mode_long = SideModeV16::DrainOnly;
+    asset.oi_eff_short_q = oi;
+    asset.loss_weight_sum_short = oi;
+    asset.stored_pos_count_short = 1;
+    asset.a_short = ADL_ONE;
     markets[0].engine.asset = AssetStateV16Account::from_runtime(&asset);
+    // The raw `engine.asset = ...` write above bypasses `set_asset_state`
+    // (2c38570a:src/v16.rs:15629-15643), which recomputes
+    // `slot_resolved_payout_blockers_v16` (:7457-7467 -- the sum of
+    // stored_pos_count_{long,short} + stale_account_count_{long,short} +
+    // pending_domain_loss_barrier_{long,short}, so 1 + 1 = 2 here) and pushes the
+    // delta into `header.resolved_payout_blocker_count` through
+    // `update_resolved_payout_blocker_total` (:8741-8748). Mirror by hand what the
+    // setter would have written; otherwise the audit-scan conjunct at :8331-8332
+    // rejects with scan=2 vs hdr=0.
+    header.resolved_payout_blocker_count = V16PodU64::new(2);
 
     let mut acct = account_fixture(77);
     acct.capital = V16PodU128::new(capital);
