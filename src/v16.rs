@@ -7544,10 +7544,44 @@ fn asset_contributes_to_loss_stale_summary(asset: AssetStateV16) -> bool {
         || asset.loss_weight_sum_short != 0)
 }
 
+/// ASSET-LOCAL loss-staleness. The first two disjuncts are K/F settlement-cohort membership
+/// (`kernel_mark_kf_stale_cohorts` reuses `stale_account_count_*` as the cohort counter), and they
+/// are deliberately NOT conjoined with the clock-lag term: an asset that is exactly on the market
+/// clock still owes K/F settlement until every member of the open cohort has discharged, and risk
+/// transfer must stay blocked until then (`trade_preflight_risk_gate` via
+/// `asset_is_loss_stale`, `h_lock_lane` via `account_has_loss_stale_live_leg`; pinned by
+/// `tests/v16_spec_tests.rs::v16_fully_accrued_kf_cohort_blocks_fresh_risk_until_every_side_settles`).
+///
+/// This predicate is asked about ONE named asset. It is NOT the market-header summary — see
+/// `asset_header_loss_stale_summary_at_slot`.
 fn asset_is_loss_stale_at_slot(asset: AssetStateV16, current_slot: u64) -> bool {
     asset.stale_account_count_long != 0
         || asset.stale_account_count_short != 0
         || (asset_contributes_to_loss_stale_summary(asset) && asset.slot_last < current_slot)
+}
+
+/// The MARKET-HEADER `loss_stale_active` summary for the asset a hot path just touched.
+///
+/// The header byte is a single bit that summarizes only the LAST TOUCHED asset (see the note at
+/// the accrual writer), and its consumers are market-wide gates that cannot name an asset: the
+/// wrapper's LP/insurance custody gate `live_domain_withdraw_health_or_shutdown_view`
+/// (`percolator-prog:src/v16_program.rs`, disjunct `group.header.loss_stale_active != 0` →
+/// `EngineLockActive`), `group_has_position_or_loss_state_for_oracle_reset`, and
+/// `apply_stress_envelope_progress`'s `active_close`. Those gates are written against the CLOCK
+/// fact — the wrapper's own asset-local twin, `asset_local_loss_stale_view`, is literally
+/// `lifecycle active/drain && asset.slot_last < current_slot && has_position_or_loss_state` — so
+/// the header byte carries the clock fact and nothing else.
+///
+/// K/F settlement-cohort membership is deliberately EXCLUDED here. It is an asset-local
+/// settlement-progress fact, true of every asset for the whole interval between a price or funding
+/// move and the last account's crank; folding it into the header byte (regression `bf2fda46`,
+/// adopting upstream `92ed4a1a`, which routed these writers through
+/// `asset_is_loss_stale_at_slot`) froze every market-wide consumer on a Live market with no stale
+/// and no lagging asset. The cohort fact is not hidden and not weakened: `stale_account_count_*`
+/// still counts, and every gate that must honour it reads it asset-locally through
+/// `asset_is_loss_stale_at_slot`.
+fn asset_header_loss_stale_summary_at_slot(asset: AssetStateV16, current_slot: u64) -> bool {
+    asset.slot_last < current_slot
 }
 
 fn slot_resolved_payout_blockers_v16(slot: &EngineAssetSlotV16Account) -> V16Result<u64> {
@@ -13708,7 +13742,7 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         account.header.legs[leg_slot] = PortfolioLegV16Account::from_runtime(&leg);
         account.header.health_cert.valid = 0;
         self.set_asset_state(asset_index, asset)?;
-        self.header.loss_stale_active = encode_bool(asset_is_loss_stale_at_slot(
+        self.header.loss_stale_active = encode_bool(asset_header_loss_stale_summary_at_slot(
             asset,
             self.header.current_slot.get(),
         ));
@@ -14742,7 +14776,7 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         // `loss_stale_active` summarize only the touched asset; safety gates
         // use account/asset-local stale checks.
         self.header.slot_last = V16PodU64::new(asset.slot_last);
-        let loss_stale_after = asset_is_loss_stale_at_slot(asset, now_slot);
+        let loss_stale_after = asset_header_loss_stale_summary_at_slot(asset, now_slot);
         self.header.loss_stale_active = encode_bool(loss_stale_after);
         if activity.price_move_active {
             self.header.oracle_epoch = V16PodU64::new(
@@ -14918,7 +14952,7 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         self.set_asset_state(asset_index, asset)?;
         self.header.current_slot = V16PodU64::new(now_slot);
         self.header.slot_last = V16PodU64::new(asset.slot_last);
-        let loss_stale_after = asset_is_loss_stale_at_slot(asset, now_slot);
+        let loss_stale_after = asset_header_loss_stale_summary_at_slot(asset, now_slot);
         self.header.loss_stale_active = encode_bool(loss_stale_after);
         self.header.oracle_epoch = V16PodU64::new(
             self.header
@@ -21500,7 +21534,7 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         account.header.legs[leg_slot] = PortfolioLegV16Account::from_runtime(&leg);
         account.header.health_cert.valid = 0;
         self.set_asset_state(asset_index, asset)?;
-        self.header.loss_stale_active = encode_bool(asset_is_loss_stale_at_slot(
+        self.header.loss_stale_active = encode_bool(asset_header_loss_stale_summary_at_slot(
             asset,
             self.header.current_slot.get(),
         ));
