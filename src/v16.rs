@@ -1141,6 +1141,83 @@ impl V16Core {
         Ok(ledger)
     }
 
+    /// PRODUCTION KERNEL: credit a mid-close PRINCIPAL settlement to the open
+    /// close ledger (F-02, ledger half).
+    ///
+    /// The five progress categories of `kernel_advance_close_ledger` all record
+    /// loss absorbed by someone OTHER than the debtor (senior support, insurance,
+    /// the loss-bearing side's social-loss index, an explicit write-off). None of
+    /// them fires when the DEBTOR pays part of its own debt from principal —
+    /// `settle_negative_pnl_from_principal_core_not_atomic` lowers `pnl` and
+    /// touches no ledger field. `drift_consumed`, the only other term in the
+    /// equation, has no writer and is additive anyway.
+    ///
+    /// So `residual_remaining` stayed at the figure captured when the close
+    /// opened even after the debt itself was partly paid. Booking the fresh
+    /// residual (the `min` at the booking site) stops the group being
+    /// over-charged, but on its own it leaves the ledger permanently short of
+    /// `finalized`: once the account's own loss reaches zero every later
+    /// `CloseResolved` returns early at `pnl >= 0`, nothing ever lowers the
+    /// ledger, and `pending_domain_loss_barrier_*` stays raised — which
+    /// `begin_close_progress_ledger` then reads to refuse EVERY future
+    /// bankruptcy close in that (asset, domain). That is the F-02 route-1c
+    /// brick, and it is what this kernel closes.
+    ///
+    /// The principal payment genuinely shrinks the loss the close set out to
+    /// absorb, so it is booked against `gross_loss_at_close_start`, keeping the
+    /// residual equation exact rather than writing `residual_remaining`
+    /// directly. The credit is clamped to the residual still outstanding (and to
+    /// the gross itself), so the equation can never go negative and a payment
+    /// larger than the remaining debt cannot manufacture progress. The debtor's
+    /// side of the same payment is already recorded on the ACCOUNT by
+    /// `record_account_residual_crystallized_loss`, so no audit fact is lost.
+    ///
+    /// Pure on `(CloseProgressLedgerV16, u128)`; the glue calls exactly this.
+    pub(crate) fn kernel_settle_close_ledger_principal(
+        mut ledger: CloseProgressLedgerV16,
+        principal_paid: u128,
+    ) -> V16Result<CloseProgressLedgerV16> {
+        if principal_paid == 0 || !ledger.active || ledger.finalized || ledger.canceled {
+            return Ok(ledger);
+        }
+        let total_loss = ledger
+            .gross_loss_at_close_start
+            .checked_add(ledger.drift_consumed)
+            .ok_or(V16Error::ArithmeticOverflow)?;
+        let progress = ledger
+            .support_consumed
+            .checked_add(ledger.insurance_spent)
+            .and_then(|v| v.checked_add(ledger.b_loss_booked))
+            .and_then(|v| v.checked_add(ledger.explicit_loss_assigned))
+            .ok_or(V16Error::ArithmeticOverflow)?;
+        if progress > total_loss {
+            return Err(V16Error::ArithmeticOverflow);
+        }
+        let outstanding = total_loss - progress;
+        let cured = principal_paid
+            .min(outstanding)
+            .min(ledger.gross_loss_at_close_start);
+        if cured == 0 {
+            return Ok(ledger);
+        }
+        ledger.gross_loss_at_close_start = ledger
+            .gross_loss_at_close_start
+            .checked_sub(cured)
+            .ok_or(V16Error::ArithmeticOverflow)?;
+        let total_loss = ledger
+            .gross_loss_at_close_start
+            .checked_add(ledger.drift_consumed)
+            .ok_or(V16Error::ArithmeticOverflow)?;
+        if progress > total_loss {
+            return Err(V16Error::ArithmeticOverflow);
+        }
+        ledger.residual_remaining = total_loss - progress;
+        if ledger.residual_remaining == 0 {
+            ledger.finalized = true;
+        }
+        Ok(ledger)
+    }
+
     /// PRODUCTION KERNEL: the attach-leg core — snapshot the side's basis
     /// anchors, gate the a-basis range, add open interest, and construct the
     /// new leg. Pure on (AssetStateV16, scalars); the attach glue calls
@@ -17089,6 +17166,50 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         account.validate_with_market(&self.as_view())
     }
 
+    /// F-02 (ledger half): book a mid-close PRINCIPAL settlement as close
+    /// progress, so the open ledger tracks the debt that is actually left.
+    ///
+    /// Mirrors `advance_close_progress_ledger`, including the
+    /// `pending_domain_loss_barrier_*` release when the ledger stops having a
+    /// pending residual — without that release the barrier stays raised and
+    /// `begin_close_progress_ledger` refuses every future bankruptcy close in the
+    /// same (asset, domain).
+    ///
+    /// Deliberately NOT fail-closed on a stale/expired ledger: this runs inside
+    /// `settle_negative_pnl_from_principal_core_not_atomic`, which is called from
+    /// eleven sites including plain liquidation and refresh, and a new error
+    /// return there would turn a recoverable ledger state into a revert on an
+    /// unrelated path. A ledger that is not open, or where the credit is zero,
+    /// is left byte-identical.
+    fn credit_close_progress_principal_settlement(
+        &mut self,
+        account: &mut PortfolioV16ViewMut<'_>,
+        principal_paid: u128,
+    ) -> V16Result<()> {
+        if principal_paid == 0 {
+            return Ok(());
+        }
+        let ledger = account.header.close_progress.try_to_runtime()?;
+        if !ledger.active || ledger.finalized || ledger.canceled {
+            return Ok(());
+        }
+        let was_pending = ledger.has_pending_residual();
+        let domain_side = ledger.domain_side;
+        let asset_index = ledger.asset_index as usize;
+        let ledger = V16Core::kernel_settle_close_ledger_principal(ledger, principal_paid)?;
+        if was_pending && !ledger.has_pending_residual() {
+            let count = self.pending_domain_loss_barrier_count(asset_index, domain_side)?;
+            self.set_pending_domain_loss_barrier_count(
+                asset_index,
+                domain_side,
+                count.checked_sub(1).ok_or(V16Error::CounterUnderflow)?,
+            )?;
+        }
+        account.header.close_progress = CloseProgressLedgerV16Account::from_runtime(&ledger);
+        account.header.health_cert.valid = 0;
+        Ok(())
+    }
+
     fn bankruptcy_residual_single_step_capacity(
         &self,
         asset_index: usize,
@@ -19192,6 +19313,12 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         self.header.c_tot = V16PodU128::new(c_tot);
         self.set_account_pnl_after_principal_settlement(account, new_pnl)?;
         Self::record_account_residual_crystallized_loss(account, paid)?;
+        // F-02 (ledger half): the debt an open close ledger is tracking just got
+        // smaller by `paid`. Credit it before the hlock auto-clear below, so a
+        // settlement that finishes the close releases
+        // `pending_domain_loss_barrier_*` in the same call and the hlock can go
+        // down with it.
+        self.credit_close_progress_principal_settlement(account, paid)?;
         if new_pnl < 0 {
             self.header.bankruptcy_hlock_active = 1;
         }
