@@ -9055,6 +9055,29 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         self.validate_source_domain_ledger_current(domain)
     }
 
+    /// C-S-04 (upstream item R): is this domain's counterparty backing bucket
+    /// still *lending-current*, i.e. `Fresh` AND unexpired?
+    ///
+    /// This is the same currency test `validate_source_domain_ledger_current`
+    /// applies just above, widened in two ways that its callers cannot use:
+    ///   * an already-`Impaired` bucket is NOT current. `validate_source_domain_
+    ///     ledger_current` only rejects `Fresh`-and-lapsed, so a bucket whose
+    ///     principal `prepare_counterparty_backing_expiry_delta` has ALREADY
+    ///     forfeited passes it.
+    ///   * the answer is a bool, not `Err(Stale)`. Valuation must stay live: a
+    ///     valuation caller has to be able to DROP a dead term without failing
+    ///     the whole certificate (an uncertifiable account is un-liquidatable,
+    ///     which is the very hole this predicate exists to close).
+    ///
+    /// It is the same predicate the engine already applies at lending time in
+    /// `create_source_credit_lien_backing_not_atomic` and in the flat-account
+    /// normalizer's expire-first arm.
+    fn source_domain_counterparty_backing_is_current(&self, domain: usize) -> V16Result<bool> {
+        let bucket = self.backing_bucket_for_domain(domain)?;
+        Ok(bucket.status == BackingBucketStatusV16::Fresh
+            && bucket.expiry_slot > self.header.current_slot.get())
+    }
+
     fn recompute_source_credit_domain_after_mutation(&mut self, domain: usize) -> V16Result<()> {
         let source = self.source_credit_for_domain_shape(domain)?;
         let (source, next_risk_epoch) = V16Core::prepare_source_credit_domain_recompute_for_epoch(
@@ -11120,10 +11143,53 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             if locked > source.source_claim_bound_num.get() {
                 return Err(V16Error::InvalidLeg);
             }
-            let valid_lien_effective = source
-                .source_lien_effective_reserved
-                .get()
-                .min(remaining_num / BOUND_SCALE);
+            // C-S-04 (upstream item R): the account-side lien mirror is NOT
+            // self-validating. `expire_source_backing_bucket_not_atomic` runs on
+            // the MARKET account alone (no account index exists, so it cannot
+            // reach the holders' mirrors), and after it the account still carries
+            // `source_lien_effective_reserved` for principal the market has moved
+            // to `impaired_liened_backing_num`. spec.md:562 ( = av:657): "An
+            // impaired lien cannot support new risk or payout ... until it
+            // deleverages, liquidates, ADLs, refreshes with new backing, or
+            // recovers"; spec.md:364 ( = av:452): impaired lien backing "is not
+            // available for new credit and does not count toward
+            // `available_backing_num`". Crediting it here is that same
+            // double-count one level up, and it is load-bearing: it zeroes
+            // `certified_liq_deficit`, so `liquidate_account_not_atomic` refuses
+            // with `NonProgress` — impairment BLOCKS the resolution the spec
+            // names as required.
+            //
+            // Only the COUNTERPARTY share is dropped. The insurance share of the
+            // same lien is backed by the domain's insurance reservation, not by
+            // this bucket, and remains good. The split is exact rather than
+            // apportioned: `validate_with_market` pins
+            // `counterparty_backing_num + insurance_backing_num ==
+            // source_lien_effective_reserved * BOUND_SCALE`
+            // (`SourceCreditLienAggregateProofV16::validate`), and
+            // `V16Core::prepare_account_counterparty_lien_impairment` — the
+            // account-side clearer the cranks eventually run — removes exactly
+            // `source_lien_counterparty_backing_num / BOUND_SCALE` from
+            // `source_lien_effective_reserved`. Valuation therefore now agrees in
+            // advance with what that clearer will book, and the certificate is
+            // invariant across it.
+            //
+            // The gate yields ZERO; it does not `?`-propagate `Stale` the way the
+            // unliened branch below does. That is deliberate: an `Err` here would
+            // make `account_haircut_equity` fail, leaving the account
+            // uncertifiable and therefore un-liquidatable — the same liveness
+            // hole in a different costume. Dropping the term lowers
+            // `certified_equity`, raises `certified_liq_deficit` and lets
+            // liquidation proceed.
+            let lien_effective_reserved = source.source_lien_effective_reserved.get();
+            let supportable_lien_effective =
+                if self.source_domain_counterparty_backing_is_current(d)? {
+                    lien_effective_reserved
+                } else {
+                    lien_effective_reserved.saturating_sub(
+                        source.source_lien_counterparty_backing_num.get() / BOUND_SCALE,
+                    )
+                };
+            let valid_lien_effective = supportable_lien_effective.min(remaining_num / BOUND_SCALE);
             if valid_lien_effective != 0 {
                 support = support
                     .checked_add(valid_lien_effective)
