@@ -10,7 +10,12 @@ name: CI
 
 on:
   push:
-    branches: [main, master]
+    # `fix/**` added 2026-09-15 (H-4). Every fix in this project is developed on its own
+    # `fix/<id>` branch and pushed BEFORE a PR exists, and a CI change that has never
+    # executed on a runner is not a verified change — the first real run of the audit-scan
+    # guard failed on a path spelling that only the runner's nested checkout layout
+    # produces. Running CI on the branch push is how that gets caught before review.
+    branches: [main, master, 'fix/**']
   pull_request:
     branches: [main, master]
 
@@ -18,7 +23,11 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  # Keyed on the PR number when there is one, so the `push` run of a `fix/**` branch and
+  # the `pull_request` run of the PR opened from it share one group and cancel each other
+  # instead of both burning a full Kani matrix on the same SHA. For a push to main there
+  # is no PR number and this is exactly the previous key (`refs/heads/main`).
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 env:
@@ -153,56 +162,184 @@ jobs:
           # shellcheck disable=SC2086
           rustfmt --edition 2021 --check $FILES
 
-  kani:
-    name: Kani Proofs
+
+  # ---------------------------------------------------------------------------
+  # Kani, PR tier. REWRITTEN 2026-09-15 (H-4).
+  #
+  # What was here before: a loop over TWO harness names out of a 331-harness census
+  # (0.6 %), self-described in this file as "a deliberate smoke check, not verification
+  # coverage". It was honest about being narrow, but it meant that every "CI green"
+  # merge carried essentially no proof coverage, and the per-fix Kani evidence in this
+  # project came from people running harnesses by hand for hours.
+  #
+  # What is here now, and what it is NOT:
+  #   - `Kani shard N` (matrix): a CURATED REQUIRED SET, .github/kani/pr_required.tsv,
+  #     covering every kernel the 2026-09 fix loop touched (F-02, F-02 proofs, F-03,
+  #     F-04, I2, K, Q, Q2) plus the two harnesses repaired in #147 that this job has
+  #     always run. Each is run on its own with `--exact --harness`, never as a bare
+  #     `cargo kani` over the suite, and each must satisfy every cover property it
+  #     declares.
+  #   - `Kani Proofs` (aggregator): the REQUIRED status context. It keeps that exact
+  #     name because branch protection on main requires it; renaming it re-blocks every
+  #     PR. It runs `if: always()` and fails when any shard did not succeed — a plain
+  #     `needs:` without `always()` would leave it SKIPPED on a shard failure, and a
+  #     skipped required check does not block a merge.
+  #   - It is STILL NOT the full census. 331 harnesses take hours; the full sweep runs
+  #     in .github/workflows/kani-full.yml on a schedule and on demand. This job is the
+  #     part that fits in a PR.
+  #
+  # Selection rule for pr_required.tsv, so the list can be maintained honestly:
+  #   (1) the harness is named in a fix dossier as evidence for a landed fix, and
+  #   (2) it declares at least one kani::cover! and satisfies all of them (an in-tree
+  #       harness with no covers reports SUCCESSFUL while proving nothing — 28 of the
+  #       331 are in that state today; they run in the scheduled tier and are reported
+  #       there as EVIDENCE-FREE, and they are barred from this list by
+  #       `kani_census.py check-required`), and
+  #   (3) it is cheap enough to keep a shard under ~20 minutes. The measured wall time
+  #       is a column of pr_required.tsv, and the excluded slow harnesses are listed at
+  #       the bottom of that file with the measurement that excluded them.
+  # ---------------------------------------------------------------------------
+  kani-shard:
+    name: Kani shard ${{ matrix.shard }}
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.93.1
       - uses: Swatinem/rust-cache@v2
-      # POLICY (decided 2026-08-27): the full 240-harness suite runs LOCALLY, not here.
-      #
-      # This job is a deliberate smoke check, not verification coverage. It exists because
-      # `Kani Proofs` is a REQUIRED status check on main: before it was restored this repo had
-      # no workflows at all, so that context could never report and every PR was permanently
-      # unmergeable. A check that cannot report is worse than a narrow one.
-      #
-      # What it actually buys, stated plainly so nobody mistakes it for more:
-      #   - Kani still installs and the crate still codegens under cfg(kani)
-      #   - the proof harnesses still compile (`--tests` builds the whole test target)
-      #   - the two harnesses below still verify, and are still NON-VACUOUS
-      # What it does NOT buy: any assurance about the other ~238 harnesses.
-      #
-      # Do NOT add slow harnesses here. Choice is a resource decision, not a taste one: a
-      # hosted runner was killed mid-check ("The runner has received a shutdown signal") on a
-      # harness that measured 799s. CBMC is memory-hungry and the historical Kani workflow used
-      # a larger blacksmith runner. The two below measure 1s and 2s; --jobs 1 keeps peak
-      # memory down.
-      #
-      # The full suite, including the two harnesses repaired in #147, is run LOCALLY with
-      # ~/percolator-ops/artifacts/kani-2026-08-24/run_kani.sh, which records a results TSV and
-      # classifies a harness with unreachable covers as VACUOUS rather than PASS.
-      - name: Install Kani
-        run: |
-          cargo install --locked kani-verifier
-          cargo kani setup
-      - name: Verify repaired harnesses
+        with:
+          # One cache for the whole matrix: every shard codegens the identical test
+          # target under cfg(kani), so any shard's cache warms all of them. Without a
+          # shared key each shard gets its own and pays the cold codegen every run.
+          shared-key: kani
+      # Cheap checks FIRST, before the Kani install and before any solver runs, so a
+      # stale list fails in seconds instead of after 20 minutes of CBMC.
+      - name: Census — tree vs kani-list.json
+        run: python3 scripts/kani_census.py check
+      - name: Required set exists in the tree, is unique, and declares covers
         run: |
           set -euo pipefail
-          for H in \
-            proof_v16_asset_recovery_transition_freezes_price_and_bumps_once \
-            proof_v17_lp_vault_cooldown_enforcement
-          do
-            echo "=== $H ==="
-            # --features fuzz is REQUIRED: `--tests` builds every test target, and the
-            # v16_fuzzing target is feature-gated. Without it cargo aborts with
-            # "target v16_fuzzing ... requires the features: fuzz" before any proof runs.
-            cargo kani --tests --features fuzz --jobs 1 --harness "$H" --output-format terse | tee "/tmp/$H.log"
-            # A pass is not enough. Kani reports SUCCESSFUL for a harness whose covers are
-            # unreachable, which is precisely how these two hid. Gate on the cover line.
-            if grep -qE "0 of [0-9]+ cover properties satisfied" "/tmp/$H.log"; then
-              echo "::error::$H is VACUOUS — cover properties unreachable"
-              exit 1
-            fi
-          done
+          # Filter comments BEFORE cut: cutting first would turn `# shard<TAB>harness`
+          # into a line that no longer starts with '#'.
+          grep -v -e '^#' -e '^[[:space:]]*$' .github/kani/pr_required.tsv \
+            | cut -f2,3 > /tmp/required_names.tsv
+          python3 scripts/kani_census.py check-required /tmp/required_names.tsv
+      - name: Install Kani
+        run: |
+          set -euo pipefail
+          # PINNED. Harness counts, the kani-list.json schema and which unstable flags a
+          # harness needs all move between Kani releases; scripts/run_kani_full_audit.sh
+          # and README.md name the same version.
+          cargo install --locked kani-verifier@0.67.0
+          cargo kani setup
+          cargo kani --version
+      - name: Build the shard list
+        run: |
+          set -euo pipefail
+          mkdir -p kani-out
+          awk -F'\t' -v s="${{ matrix.shard }}" \
+            '$0 !~ /^#/ && $1 == s { print $2 "\t" $3 }' \
+            .github/kani/pr_required.tsv > kani-out/shard.txt
+          N=$(grep -c . kani-out/shard.txt || true)
+          echo "shard ${{ matrix.shard }}: $N harness name(s)"
+          cat kani-out/shard.txt
+          # A shard that selected nothing is a broken matrix, not a pass.
+          if [ "${N:-0}" -eq 0 ]; then
+            echo "::error::shard ${{ matrix.shard }} selected 0 harnesses from .github/kani/pr_required.tsv"
+            exit 1
+          fi
+      - name: Verify
+        env:
+          KANI_REQUIRE_COVERS: '1'
+        run: scripts/kani_ci_shard.sh kani-out/shard.txt kani-out/results.tsv
+      - name: Shard summary
+        if: always()
+        run: |
+          set -uo pipefail
+          {
+            echo "### Kani shard ${{ matrix.shard }}"
+            echo ""
+            echo '```'
+            cat kani-out/results.tsv 2>/dev/null || echo "(no results)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: kani-pr-tier-shard-${{ matrix.shard }}
+          path: kani-out/
+          retention-days: 14
+
+  kani:
+    # THE REQUIRED CONTEXT. Do not rename: branch protection on main requires the
+    # string "Kani Proofs" and a rename makes every PR unmergeable.
+    name: Kani Proofs
+    needs: [kani-shard]
+    # `always()` is load-bearing: with the default `if`, a failing shard makes this job
+    # SKIPPED, and GitHub treats a skipped required check as satisfied. That would turn
+    # a Kani failure into a green merge.
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: kani-pr-tier-shard-*
+          path: shards
+          merge-multiple: false
+      - name: Every shard succeeded, and every required harness reported
+        run: |
+          set -euo pipefail
+          RESULT='${{ needs.kani-shard.result }}'
+          echo "kani-shard matrix result: $RESULT"
+
+          EXPECTED=$(grep -vc -e '^#' -e '^[[:space:]]*$' .github/kani/pr_required.tsv)
+          echo "required harnesses declared: $EXPECTED"
+
+          printf 'harness\tstatus\twall_s\trc\tverified\tfailures\ttotal\tcovers_sat\tcovers_total\tchecks_failed\tchecks_total\n' > all.tsv
+          find shards -name results.tsv -print0 \
+            | xargs -0 -I{} sh -c 'tail -n +2 "{}"' >> all.tsv || true
+          GOT=$(( $(wc -l < all.tsv) - 1 ))
+          echo "harness results collected: $GOT"
+
+          sort -t"$(printf '\t')" -k3,3nr all.tsv | head -100 || true
+
+          # Exit code alone is not a measurement: a shard whose list selected nothing,
+          # or whose upload was lost, exits 0 with no rows. Assert the COUNT.
+          if [ "$GOT" -ne "$EXPECTED" ]; then
+            echo "::error::collected $GOT harness results but .github/kani/pr_required.tsv declares $EXPECTED"
+            exit 1
+          fi
+          BAD=$(tail -n +2 all.tsv | awk -F'\t' '$2 != "OK"' || true)
+          if [ -n "$BAD" ]; then
+            echo "::error::harnesses not OK:"
+            echo "$BAD"
+            exit 1
+          fi
+          if [ "$RESULT" != "success" ]; then
+            echo "::error::Kani PR tier failed: shard matrix result = $RESULT"
+            exit 1
+          fi
+          TOTALWALL=$(tail -n +2 all.tsv | awk -F'\t' '{s+=$3} END {print s+0}')
+          SLOWEST=$(tail -n +2 all.tsv | sort -t"$(printf '\t')" -k3,3nr | head -1)
+          {
+            echo "### Kani Proofs — PR tier"
+            echo ""
+            echo "- required harnesses: **$EXPECTED**, all OK"
+            echo "- non-vacuity: every harness satisfied **all** of its declared cover properties"
+            echo "- summed solver wall time across shards: **${TOTALWALL}s**"
+            echo "- slowest: \`$(echo "$SLOWEST" | cut -f1)\` at $(echo "$SLOWEST" | cut -f3)s"
+            echo ""
+            echo "This is the curated PR tier, not the census. The full $(python3 scripts/kani_census.py census | wc -l | tr -d ' ')-harness sweep runs in \`Kani full census\` (nightly / workflow_dispatch)."
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: kani-pr-tier-all
+          path: all.tsv
+          retention-days: 14

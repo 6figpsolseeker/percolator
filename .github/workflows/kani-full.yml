@@ -1,0 +1,285 @@
+name: Kani full census
+
+# The SCHEDULED tier. Added 2026-09-15 (H-4).
+#
+# Why it exists. `Kani Proofs` in ci.yml runs a curated required set on every PR —
+# the harnesses that back the fixes this project has landed, each in a few minutes.
+# That is the part that fits in a PR. It is not the census: this tree has 331
+# `#[kani::proof]` harnesses and the full sweep is hours of CBMC. Before this
+# workflow, the full sweep existed only as something a person ran by hand on a
+# laptop, and the results were kept in a scratch directory; the one time a
+# "328 of 328" claim had to be reproduced, the logs were gone.
+#
+# What it asserts, in order:
+#   1. the census is not stale — the source tree, kani-list.json, and the totals
+#      row in kani-list.json must agree exactly (three views that have disagreed
+#      before: 471 in README, 305 in kani-list.json, 240 in the workflow comment,
+#      against a measured 328);
+#   2. every harness in the census verifies — sharded, one `--exact --harness` per
+#      harness, `Complete - N ... 0 failures, N total` with N equal to the number of
+#      definitions that name has (the tree contains one duplicated name, and
+#      `--exact` runs BOTH definitions);
+#   3. it publishes a TSV of (harness, status, wall, covers, checks) as an artefact,
+#      so a coverage claim is reproducible from an artefact rather than from prose;
+#   4. harnesses that declare no `kani::cover!`, or that leave a declared cover
+#      unsatisfied, are reported as EVIDENCE-FREE in the summary instead of being
+#      counted as passes. Kani prints SUCCESSFUL for a harness whose covers are
+#      unreachable; 28 of the 331 harnesses declare no cover at all today.
+#
+# Failing here does not block a merge — it is a scheduled job, not a required
+# context — but it is the only thing in this repo that can honestly say "the whole
+# suite is green at <sha>".
+
+on:
+  schedule:
+    # 05:10 UTC nightly. Not on the hour: GitHub's scheduler queues heavily at :00.
+    - cron: '10 5 * * *'
+  workflow_dispatch:
+    inputs:
+      shards:
+        description: 'Number of parallel shards (1-40)'
+        required: false
+        default: '12'
+      ref:
+        description: 'Ref to verify (default: the branch this is dispatched on)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  # Never two full sweeps at once — they are hours long and would just starve each
+  # other. cancel-in-progress is deliberately FALSE: a running sweep is expensive and
+  # a newly scheduled one must wait rather than kill it.
+  group: kani-full-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_MIN_STACK: 8388608
+
+jobs:
+  plan:
+    name: Census and shard plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      shards: ${{ steps.plan.outputs.shards }}
+      names: ${{ steps.plan.outputs.names }}
+      census: ${{ steps.plan.outputs.census }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - name: Census — tree vs kani-list.json (fails on a stale list)
+        run: python3 scripts/kani_census.py check
+      - name: Plan the shards
+        id: plan
+        run: |
+          set -euo pipefail
+          N="${{ inputs.shards || '12' }}"
+          case "$N" in ''|*[!0-9]*) echo "::error::shards must be a number"; exit 1;; esac
+          if [ "$N" -lt 1 ] || [ "$N" -gt 40 ]; then
+            echo "::error::shards must be between 1 and 40"; exit 1
+          fi
+          mkdir -p kani-plan
+          python3 scripts/kani_census.py shards "$N" \
+            .github/kani/full_costs.tsv .github/kani/heavy.txt > kani-plan/plan.tsv
+          # The plan has one row per harness NAME; the census has one row per
+          # harness DEFINITION. They differ, on purpose: one name in this tree is
+          # defined twice and `--exact --harness` runs both definitions. Column 3 of
+          # the plan is that expected count, so the plan covers the census iff the
+          # column-3 sum equals the census size. Comparing row counts instead would
+          # be off by exactly the number of duplicated names.
+          NAMES=$(wc -l < kani-plan/plan.tsv | tr -d ' ')
+          CENSUS=$(awk -F'\t' '{s+=$3} END {print s+0}' kani-plan/plan.tsv)
+          TREE=$(python3 scripts/kani_census.py census | wc -l | tr -d ' ')
+          echo "plan: $NAMES harness names -> $CENSUS harnesses across $N shards (tree census $TREE)"
+          if [ "$CENSUS" != "$TREE" ]; then
+            echo "::error::shard plan covers $CENSUS harnesses but the tree census is $TREE"
+            exit 1
+          fi
+          DUP=$(awk -F'\t' '!seen[$2]++' kani-plan/plan.tsv | wc -l | tr -d ' ')
+          if [ "$DUP" != "$NAMES" ]; then
+            echo "::error::shard plan lists a harness name more than once"
+            exit 1
+          fi
+          awk -F'\t' '{print $1}' kani-plan/plan.tsv | sort | uniq -c | sort -k2n
+          LIST=$(seq 1 "$N" | paste -sd, - | sed 's/^/[/; s/$/]/')
+          echo "shards=$LIST" >> "$GITHUB_OUTPUT"
+          echo "names=$NAMES" >> "$GITHUB_OUTPUT"
+          echo "census=$CENSUS" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kani-full-plan
+          path: kani-plan/
+          retention-days: 30
+
+  verify:
+    name: Full census shard ${{ matrix.shard }}
+    needs: plan
+    runs-on: ubuntu-latest
+    # GitHub's hard ceiling for a job is 6 h. The heaviest harnesses measured in this
+    # project are 1800 s and 799 s solo (and 3710 s / 7093 s on a loaded box), and
+    # .github/kani/heavy.txt gives each of those a shard to itself, so a shard that
+    # runs long is a real regression rather than a queueing artefact.
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.plan.outputs.shards) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - uses: dtolnay/rust-toolchain@1.93.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: kani
+          # Never write the cache from the nightly: the PR tier's cache is the one
+          # PRs restore, and a 16-way race would just churn it.
+          save-if: 'false'
+      - uses: actions/download-artifact@v4
+        with:
+          name: kani-full-plan
+          path: kani-plan
+      - name: Install Kani
+        run: |
+          set -euo pipefail
+          cargo install --locked kani-verifier@0.67.0
+          cargo kani setup
+          cargo kani --version
+      - name: Build the shard list
+        run: |
+          set -euo pipefail
+          mkdir -p kani-out
+          awk -F'\t' -v s="${{ matrix.shard }}" '$1 == s { print $2 "\t" $3 }' \
+            kani-plan/plan.tsv > kani-out/shard.txt
+          N=$(grep -c . kani-out/shard.txt || true)
+          echo "shard ${{ matrix.shard }}: $N harness name(s)"
+          if [ "${N:-0}" -eq 0 ]; then
+            echo "::error::shard ${{ matrix.shard }} selected 0 harnesses"
+            exit 1
+          fi
+      - name: Verify
+        env:
+          # The scheduled tier MUST run the 28 in-tree harnesses that declare no
+          # kani::cover!, so it cannot fail on them. They are classified OK-NOCOVER in
+          # the TSV and reported as EVIDENCE-FREE by the report job — recorded, never
+          # counted as proof. The PR tier bars them outright.
+          KANI_REQUIRE_COVERS: '0'
+        run: scripts/kani_ci_shard.sh kani-out/shard.txt kani-out/results.tsv
+      - name: Shard summary
+        if: always()
+        run: |
+          set -uo pipefail
+          {
+            echo "### Full census shard ${{ matrix.shard }}"
+            echo ""
+            echo '```'
+            cat kani-out/results.tsv 2>/dev/null || echo "(no results)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: kani-full-shard-${{ matrix.shard }}
+          path: kani-out/
+          retention-days: 30
+
+  report:
+    name: Full census report
+    needs: [plan, verify]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: kani-full-shard-*
+          path: shards
+      - name: Merge, classify, publish
+        run: |
+          set -euo pipefail
+          # One TSV row per harness NAME (the shard script runs one `cargo kani`
+          # per name); the census counts DEFINITIONS and is larger by the number of
+          # duplicated names.
+          EXPECTED='${{ needs.plan.outputs.names }}'
+          CENSUS='${{ needs.plan.outputs.census }}'
+          printf 'harness\tstatus\twall_s\trc\tverified\tfailures\ttotal\tcovers_sat\tcovers_total\tchecks_failed\tchecks_total\n' > kani_full_census.tsv
+          find shards -name results.tsv -print0 \
+            | xargs -0 -I{} sh -c 'tail -n +2 "{}"' >> kani_full_census.tsv || true
+          GOT=$(( $(wc -l < kani_full_census.tsv) - 1 ))
+
+          OK=$(awk -F'\t' 'NR>1 && $2=="OK"' kani_full_census.tsv | wc -l | tr -d ' ')
+          NOCOVER=$(awk -F'\t' 'NR>1 && $2=="OK-NOCOVER"' kani_full_census.tsv | wc -l | tr -d ' ')
+          PARTIAL=$(awk -F'\t' 'NR>1 && $2=="OK-PARTIAL-COVER"' kani_full_census.tsv | wc -l | tr -d ' ')
+          VACUOUS=$(awk -F'\t' 'NR>1 && $2=="VACUOUS"' kani_full_census.tsv | wc -l | tr -d ' ')
+          BAD=$(awk -F'\t' 'NR>1 && $2!="OK" && $2!="OK-NOCOVER" && $2!="OK-PARTIAL-COVER"' kani_full_census.tsv | wc -l | tr -d ' ')
+          WALL=$(awk -F'\t' 'NR>1 {s+=$3} END {print s+0}' kani_full_census.tsv)
+
+          {
+            echo "## Kani full census — \`$(git rev-parse --short HEAD)\`"
+            echo ""
+            echo "| | count |"
+            echo "|---|---:|"
+            echo "| census (tree == kani-list.json) | **${CENSUS}** harnesses in **${EXPECTED}** names |"
+            echo "| results collected | **${GOT}** |"
+            echo "| SUCCESSFUL **with every declared cover satisfied** | **${OK}** |"
+            echo "| SUCCESSFUL but **declares no cover** — EVIDENCE-FREE | ${NOCOVER} |"
+            echo "| SUCCESSFUL with **some cover unsatisfied** — EVIDENCE-FREE | ${PARTIAL} |"
+            echo "| SUCCESSFUL with **no cover satisfied** — VACUOUS | ${VACUOUS} |"
+            echo "| failed / errored / count-mismatch | ${BAD} |"
+            echo "| summed solver wall | ${WALL}s |"
+            echo ""
+            echo "**Read the first two rows together.** Only the \`OK\` row is proof coverage."
+            echo "A harness with no \`kani::cover!\` reports \`VERIFICATION:- SUCCESSFUL\` while"
+            echo "proving nothing, so it is listed here and never added to the pass count."
+            if [ "${NOCOVER}" != "0" ] || [ "${PARTIAL}" != "0" ] || [ "${VACUOUS}" != "0" ]; then
+              echo ""
+              echo "<details><summary>Evidence-free harnesses</summary>"
+              echo ""
+              echo '```'
+              awk -F'\t' 'NR>1 && ($2=="OK-NOCOVER"||$2=="OK-PARTIAL-COVER"||$2=="VACUOUS") {printf "%-96s %s covers %s/%s\n", $1, $2, $8, $9}' kani_full_census.tsv
+              echo '```'
+              echo "</details>"
+            fi
+            if [ "${BAD}" != "0" ]; then
+              echo ""
+              echo "### Failures"
+              echo '```'
+              awk -F'\t' 'NR>1 && $2!="OK" && $2!="OK-NOCOVER" && $2!="OK-PARTIAL-COVER"' kani_full_census.tsv
+              echo '```'
+            fi
+            echo ""
+            echo "### Slowest 20"
+            echo '```'
+            awk -F'\t' 'NR>1' kani_full_census.tsv | sort -t"$(printf '\t')" -k3,3nr | head -20 | awk -F'\t' '{printf "%7ss  %s\n", $3, $1}'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Assert the COUNT, not just the exit codes: a lost artefact or a shard that
+          # selected nothing exits 0 and reports no rows.
+          if [ "$GOT" -ne "$EXPECTED" ]; then
+            echo "::error::collected $GOT harness-name results but the plan declares $EXPECTED — a shard did not report"
+            exit 1
+          fi
+          if [ "$BAD" != "0" ]; then
+            echo "::error::$BAD harness(es) did not verify"
+            exit 1
+          fi
+          if [ '${{ needs.verify.result }}' != 'success' ]; then
+            echo "::error::shard matrix result = ${{ needs.verify.result }}"
+            exit 1
+          fi
+          echo "full census green: ${OK} of ${EXPECTED} names with covers, ${NOCOVER} evidence-free"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: kani-full-census-tsv
+          path: kani_full_census.tsv
+          retention-days: 90

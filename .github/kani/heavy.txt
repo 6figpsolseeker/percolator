@@ -1,0 +1,24 @@
+# Harnesses that get a SHARD TO THEMSELVES in .github/workflows/kani-full.yml.
+#
+# Rule: anything measured at >= 600 s solo. On a GitHub hosted runner (slower than
+# the box those numbers came from) that is already >= ~20 min, and letting the
+# bin-packer put two of them together is how a shard ends up near the 6 h job
+# ceiling for a reason that has nothing to do with a regression.
+#
+# The packer assigns these in file order, one per shard, starting at shard 1, then
+# LPT-packs everything else into the remaining shards. If this file ever grows
+# past the shard count the packer falls back to packing everything, so adding a
+# name here can never silently drop a harness from the sweep.
+#
+# name                                                              solo wall (2026-08-24)
+proof_v16_terminal_realization_floored_rate_pays_zero_and_moves_nothing
+# ^ 1800 s: that run's own per-harness cap, recorded as TIMEOUT -- so 1800 s is a
+#   LOWER bound, not a measurement. It completed at 3710 s on a loaded box at
+#   22440ebb (SUCCESSFUL, 2 of 2 covers, 0 of 8010 checks failed).
+proof_v16_expired_backing_yields_zero_realizable_support_after_expiry
+# ^ 799 s solo; 7093 s on the same loaded box. The single most expensive harness
+#   that actually finishes.
+proof_v17_wide_mul_div_floor_stub_correct
+# ^ 736 s solo. Note the near-name trap: proof_v17_wide_mul_div_floor_postcondition_u16
+#   is written inside a DOC COMMENT in tests/proofs_v17_fork.rs and is not a harness
+#   at all; this one is real.
