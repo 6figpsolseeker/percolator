@@ -20465,15 +20465,24 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             }
             if bucket.status == BackingBucketStatusV16::Fresh && bucket.expiry_slot <= current_slot
             {
-                if source.source_claim_liened_num.get() != 0 {
-                    // This fork's release takes the #146 terminal flag; the
-                    // Resolved wind-down is exactly upstream's unflagged body.
-                    self.release_account_source_credit_lien_for_domain_not_atomic(
-                        account, domain, true,
-                    )?;
-                } else {
-                    self.expire_source_backing_bucket_not_atomic(domain, current_slot)?;
-                }
+                // C-S-20b: a LAPSED `Fresh` bucket takes the canonical expiry
+                // rule, whether or not this account still holds a lien on it.
+                // The liened branch used to select the lapsed bucket straight
+                // into the expiry-agnostic terminal release, which un-pledges
+                // `valid_liened -> fresh_unliened` and leaves the bucket `Fresh`
+                // — the Resolved twin of C-S-20. That contradicts spec.md:562
+                // (an expired counterparty bucket makes the lien `Impaired`) and
+                // the no-inflation MUST at spec.md:342-357, and it makes the
+                // crank ORDER decide the stock class: closing an UNLIENED
+                // co-tenant first took the `else` arm and forfeited the same
+                // atoms to the junior pool.
+                //
+                // Expiry moves this account's share to the impaired counters;
+                // the account's next preparation step then takes the Impaired
+                // arm above (`:20424-20440`), which crystallizes the utilization
+                // fee, retires the market-side impaired counters and relabels
+                // the claim — so the close still progresses.
+                self.expire_source_backing_bucket_not_atomic(domain, current_slot)?;
                 account.compact_source_domains();
                 account.header.health_cert.valid = 0;
                 self.validate_shape()?;

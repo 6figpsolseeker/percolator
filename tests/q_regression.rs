@@ -24,7 +24,7 @@ use percolator::{
     AutoCrankWorkV16, BackingBucketStatusV16, EngineAssetSlotV16Account, Market,
     MarketGroupV16HeaderAccount, MarketGroupV16ViewMut, PermissionlessProgressOutcomeV16,
     PortfolioAccountV16Account, PortfolioV16ViewMut, ProvenanceHeaderV16,
-    ProvenanceHeaderV16Account, TradeRequestV16, V16Config, V16PodU64,
+    ProvenanceHeaderV16Account, ResolvedCloseOutcomeV16, TradeRequestV16, V16Config, V16PodU64,
     v16_domain_count_for_market_slots,
 };
 use percolator::{BOUND_SCALE, POS_SCALE};
@@ -487,4 +487,334 @@ fn q_live_tag48_sync_maintenance_fee_also_forfeits() {
         released > 0 && after.fresh < before.fresh + released,
         "FIXED: the released lien did not land in fresh_unliened"
     );
+}
+
+// ===========================================================================
+// PART 2 — Q-Resolved: C-S-20b,
+// `prepare_one_source_domain_for_resolved_close_not_atomic`
+// ===========================================================================
+
+const RESOLVE_SLOT: u64 = 5;
+const BACKING_EXPIRY_SLOT: u64 = 4;
+
+struct ResolvedFixture {
+    header: MarketGroupV16HeaderAccount,
+    markets: Vec<Market<u64>>,
+    /// the LIENED winner: holds `source_claim_liened_num != 0` on CP_DOMAIN.
+    winner_header: PortfolioAccountV16Account,
+    peer_header: PortfolioAccountV16Account,
+    /// UNLIENED co-tenant on the SAME domain: its close used to take the `else`
+    /// arm and expire the bucket, which is what made the crank ORDER decide the
+    /// stock class.
+    trigger_header: PortfolioAccountV16Account,
+    loser_header: PortfolioAccountV16Account,
+    liened_backing_num: u128,
+}
+
+/// The C-S-20b fixture: a RESOLVED market whose CP_DOMAIN bucket is `Fresh` with
+/// `expiry_slot (4) <= current_slot (5)` and NOT expired, carrying a live
+/// counterparty lien created while the bucket was still unlapsed.
+fn resolved_lapsed_fixture() -> ResolvedFixture {
+    let (mut header, mut markets) = market_fixture(1, 100);
+    header.config.maintenance_margin_bps = V16PodU64::new(1_000);
+    header.config.initial_margin_bps = V16PodU64::new(5_000);
+    header.config.max_price_move_bps_per_slot = V16PodU64::new(500);
+    header.config.max_accrual_dt_slots = V16PodU64::new(1);
+    header.config.min_funding_lifetime_slots = V16PodU64::new(1);
+    let mut winner_header = account_fixture(1, 40);
+    let mut peer_header = account_fixture(1, 41);
+    let mut trigger_header = account_fixture(1, 42);
+    let mut loser_header = account_fixture(1, 43);
+
+    let liened_backing_num;
+    {
+        let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+        let mut winner = PortfolioV16ViewMut::new(&mut winner_header);
+        let mut peer = PortfolioV16ViewMut::new(&mut peer_header);
+        let mut trigger = PortfolioV16ViewMut::new(&mut trigger_header);
+        let mut loser = PortfolioV16ViewMut::new(&mut loser_header);
+
+        market
+            .deposit_fresh_counterparty_backing_not_atomic(
+                CP_DOMAIN,
+                BACKING_PRINCIPAL,
+                BACKING_EXPIRY_SLOT,
+            )
+            .unwrap();
+        market.deposit_not_atomic(&mut winner, 52_501).unwrap();
+        market.deposit_not_atomic(&mut peer, 1_000_000).unwrap();
+        market.deposit_not_atomic(&mut trigger, 1_000_000).unwrap();
+        market.deposit_not_atomic(&mut loser, 1_000_000).unwrap();
+
+        for (a, b) in [(&mut winner, &mut peer), (&mut trigger, &mut loser)] {
+            trade(
+                &mut market,
+                a,
+                b,
+                TradeRequestV16 {
+                    asset_index: ASSET,
+                    size_q: signed_q(OPEN_Q),
+                    exec_price: 100,
+                    fee_bps: 0,
+                },
+            );
+        }
+
+        market
+            .set_asset_raw_oracle_target_not_atomic(ASSET, 105)
+            .unwrap();
+        market
+            .accrue_asset_to_not_atomic(ASSET, 2, 105, 0, true)
+            .unwrap();
+        for a in [&mut peer, &mut loser, &mut winner, &mut trigger] {
+            market.full_account_refresh_not_atomic(a).unwrap();
+        }
+        assert_eq!(winner.header.pnl.get(), 5_000);
+        assert_eq!(trigger.header.pnl.get(), 5_000);
+
+        trade(
+            &mut market,
+            &mut winner,
+            &mut peer,
+            TradeRequestV16 {
+                asset_index: ASSET,
+                size_q: signed_q(INCREASE_Q),
+                exec_price: 105,
+                fee_bps: 0,
+            },
+        );
+        let lien = winner.header.source_domains[0];
+        assert_eq!(lien.domain.get() as usize, CP_DOMAIN);
+        liened_backing_num = lien.source_lien_counterparty_backing_num.get();
+        assert!(liened_backing_num > 0, "counterparty-backed lien expected");
+        let co = trigger.header.source_domains[0];
+        assert_eq!(co.domain.get() as usize, CP_DOMAIN);
+        assert_eq!(co.source_claim_liened_num.get(), 0, "co-tenant must be unliened");
+
+        for slot in 3..=RESOLVE_SLOT {
+            market
+                .accrue_asset_to_not_atomic(ASSET, slot, 105, 0, true)
+                .unwrap();
+        }
+        market.resolve_market_not_atomic(RESOLVE_SLOT).unwrap();
+        let b = bucket_of(&market);
+        assert_eq!(
+            b.status,
+            BackingBucketStatusV16::Fresh,
+            "resolution itself does not canonicalize the lapsed bucket"
+        );
+        assert!(b.expiry <= market.header.current_slot.get());
+        assert_eq!(b.valid, liened_backing_num);
+    }
+
+    ResolvedFixture {
+        header,
+        markets,
+        winner_header,
+        peer_header,
+        trigger_header,
+        loser_header,
+        liened_backing_num,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Snap {
+    bucket: Bucket,
+    src_fresh_total: u128,
+    /// recomputed exactly as the private `residual()`.
+    residual: u128,
+    vault: u128,
+    c_tot: u128,
+}
+
+fn snap(market: &MarketGroupV16ViewMut<'_, u64>) -> Snap {
+    let vault = market.header.vault.get();
+    let c_tot = market.header.c_tot.get();
+    let insurance = market.header.insurance.get();
+    let bpe = market.header.backing_provider_earnings_total.get();
+    let src_fresh_total = market.header.source_fresh_backing_total_num.get();
+    Snap {
+        bucket: bucket_of(market),
+        src_fresh_total,
+        residual: vault.saturating_sub(c_tot + insurance + bpe + (src_fresh_total / BOUND_SCALE)),
+        vault,
+        c_tot,
+    }
+}
+
+/// Round-robin permissionless wind-down of every account until quiescent.
+fn wind_down_all(fx: &mut ResolvedFixture, label: &str) -> Vec<(&'static str, String)> {
+    let mut market = MarketGroupV16ViewMut::new(&mut fx.header, &mut fx.markets);
+    let mut winner = PortfolioV16ViewMut::new(&mut fx.winner_header);
+    let mut peer = PortfolioV16ViewMut::new(&mut fx.peer_header);
+    let mut trigger = PortfolioV16ViewMut::new(&mut fx.trigger_header);
+    let mut loser = PortfolioV16ViewMut::new(&mut fx.loser_header);
+    let mut accounts: Vec<(&'static str, &mut PortfolioV16ViewMut<'_>, Option<String>)> = vec![
+        ("winner", &mut winner, None),
+        ("peer", &mut peer, None),
+        ("trigger", &mut trigger, None),
+        ("loser", &mut loser, None),
+    ];
+    let mut rounds = 0usize;
+    loop {
+        rounds += 1;
+        let mut progressed = false;
+        for (_, acct, done) in accounts.iter_mut() {
+            if done.is_some() {
+                continue;
+            }
+            match market.close_resolved_account_not_atomic(acct, 0) {
+                Ok(ResolvedCloseOutcomeV16::ProgressOnly) => progressed = true,
+                Ok(other) => *done = Some(format!("{other:?}")),
+                Err(e) => *done = Some(format!("Err({e:?})")),
+            }
+        }
+        if !progressed || rounds > 4_000 {
+            break;
+        }
+    }
+    let out: Vec<(&'static str, String)> = accounts
+        .iter()
+        .map(|(n, _, d)| (*n, d.clone().unwrap_or_else(|| "STUCK-ProgressOnly".into())))
+        .collect();
+    println!("[{label}] wind-down rounds={rounds} outcomes={out:?}");
+    out
+}
+
+/// C-S-20b FIXED: the liened winner's own resolved close applies the canonical
+/// expiry rule to the lapsed bucket instead of selecting it into the
+/// expiry-agnostic terminal release.
+#[test]
+fn q_resolved_close_on_lapsed_bucket_forfeits_instead_of_un_pledging() {
+    let mut fx = resolved_lapsed_fixture();
+    let lien = fx.liened_backing_num;
+    let mut market = MarketGroupV16ViewMut::new(&mut fx.header, &mut fx.markets);
+    let pre = snap(&market);
+    let mut winner = PortfolioV16ViewMut::new(&mut fx.winner_header);
+
+    // LIVENESS: the close still progresses.
+    let first = market.close_resolved_account_not_atomic(&mut winner, 0);
+    println!("[Q-resolved] winner's first close -> {first:?}");
+    first.expect("the terminal close must still accept the lapsed bucket");
+
+    let step1 = snap(&market);
+    println!(
+        "[Q-resolved] after step 1: status={:?} valid={} fresh={} impaired={}",
+        step1.bucket.status, step1.bucket.valid, step1.bucket.fresh, step1.bucket.impaired
+    );
+    println!(
+        "[Q-resolved] source_fresh_backing_total_num {} -> {}   residual() {} -> {}",
+        pre.src_fresh_total, step1.src_fresh_total, pre.residual, step1.residual
+    );
+
+    assert_eq!(step1.bucket.valid, 0, "the lien is off the bucket either way");
+    assert_eq!(
+        step1.bucket.impaired, lien,
+        "FIXED: the expiry rule moves the liened principal valid_liened -> IMPAIRED"
+    );
+    assert_eq!(
+        step1.bucket.fresh, 0,
+        "FIXED: nothing is un-pledged back into fresh_unliened"
+    );
+    assert_eq!(
+        step1.bucket.status,
+        BackingBucketStatusV16::Impaired,
+        "FIXED: the lapsed bucket leaves Fresh, so the tag-50 withdraw gate no longer \
+         sees a withdrawable bucket"
+    );
+    assert_eq!(
+        step1.src_fresh_total, 0,
+        "FIXED: the senior term is released in full"
+    );
+    assert_eq!(
+        step1.residual,
+        pre.residual + pre.src_fresh_total / BOUND_SCALE,
+        "FIXED: residual() (the junior pool) GAINS the whole forfeited principal"
+    );
+
+    let w = market
+        .withdraw_fresh_counterparty_backing_not_atomic(CP_DOMAIN, (lien / BOUND_SCALE).max(1));
+    println!("[Q-resolved] provider tag50 in the window -> {w:?}");
+    assert!(
+        w.is_err(),
+        "FIXED: there is no window in which the provider can withdraw it: {w:?}"
+    );
+}
+
+/// The three permissionless crank orderings now agree on where the atoms land.
+/// A = market-side expiry first; B = the liened winner closes first; C = the
+/// UNLIENED co-tenant closes first.
+#[test]
+fn q_resolved_crank_order_no_longer_decides_the_stock_class() {
+    let run = |label: &'static str, order: u8| -> (Snap, Snap, Vec<(&'static str, String)>) {
+        let mut fx = resolved_lapsed_fixture();
+        let lien = fx.liened_backing_num;
+        let step1;
+        {
+            let mut market = MarketGroupV16ViewMut::new(&mut fx.header, &mut fx.markets);
+            match order {
+                0 => {
+                    let now = market.header.current_slot.get();
+                    market
+                        .expire_source_backing_bucket_not_atomic(CP_DOMAIN, now)
+                        .expect("A: the canonical expiry transition");
+                }
+                1 => {
+                    let mut winner = PortfolioV16ViewMut::new(&mut fx.winner_header);
+                    market
+                        .close_resolved_account_not_atomic(&mut winner, 0)
+                        .expect("B: the liened winner's own close");
+                }
+                _ => {
+                    let mut trigger = PortfolioV16ViewMut::new(&mut fx.trigger_header);
+                    market
+                        .close_resolved_account_not_atomic(&mut trigger, 0)
+                        .expect("C: the unliened co-tenant's close");
+                }
+            }
+            step1 = snap(&market);
+            let w = market.withdraw_fresh_counterparty_backing_not_atomic(
+                CP_DOMAIN,
+                (lien / BOUND_SCALE).max(1),
+            );
+            println!("[{label}] step1={step1:?}");
+            println!("[{label}] provider tag50 in the window -> {w:?}");
+            assert!(w.is_err(), "{label}: no ordering opens a withdrawal window");
+        }
+        let outcomes = wind_down_all(&mut fx, label);
+        let market = MarketGroupV16ViewMut::new(&mut fx.header, &mut fx.markets);
+        let fin = snap(&market);
+        println!("[{label}] FINAL={fin:?}");
+        (step1, fin, outcomes)
+    };
+
+    let (a1, a_fin, a_out) = run("A expire-first", 0);
+    let (b1, b_fin, b_out) = run("B winner-first", 1);
+    let (c1, c_fin, c_out) = run("C co-tenant-first", 2);
+
+    assert_eq!(a1.bucket, b1.bucket, "A and B agree on the bucket after step 1");
+    assert_eq!(a1.bucket, c1.bucket, "A and C agree on the bucket after step 1");
+    assert_eq!(a1.residual, b1.residual, "A and B agree on the junior pool");
+    assert_eq!(a1.residual, c1.residual, "A and C agree on the junior pool");
+    assert_eq!(a_fin.vault, b_fin.vault, "FIXED: the ordering costs the vault nothing");
+    assert_eq!(a_fin.vault, c_fin.vault);
+    assert_eq!(a_fin.residual, b_fin.residual, "FIXED: the junior pool is ordering-independent");
+    assert_eq!(a_fin.residual, c_fin.residual);
+
+    // LIVENESS: every ordering winds the whole market down; nobody is stuck.
+    for (label, out, fin) in [
+        ("A", &a_out, &a_fin),
+        ("B", &b_out, &b_fin),
+        ("C", &c_out, &c_fin),
+    ] {
+        assert_eq!(out.len(), 4);
+        for (who, outcome) in out.iter() {
+            assert!(
+                !outcome.starts_with("Err(") && outcome != "STUCK-ProgressOnly",
+                "{label}/{who}: wind-down must still complete, got {outcome}"
+            );
+        }
+        assert_eq!(fin.c_tot, 0, "{label}: full wind-down reaches c_tot == 0");
+    }
 }
