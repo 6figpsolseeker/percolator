@@ -11120,21 +11120,81 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             if locked > source.source_claim_bound_num.get() {
                 return Err(V16Error::InvalidLeg);
             }
-            let valid_lien_effective = source
-                .source_lien_effective_reserved
-                .get()
-                .min(remaining_num / BOUND_SCALE);
-            if valid_lien_effective != 0 {
+            // C-S-04 (upstream item R). The code of this block is upstream's,
+            // taken verbatim from Anatoly's `faa3bcf9` ("Fail closed on expired
+            // counterparty liens", 2026-07-15) as it stands at the tip of
+            // `av/codex/lof-dos-proof-sweep-20260712` — a branch that has never
+            // been merged into `av/master`, so `av/master` (8eb7142a) and this
+            // fork both still carried the defect.
+            //
+            // Why it is needed: the account-side lien mirror is NOT
+            // self-validating. `expire_source_backing_bucket_not_atomic` runs on
+            // the MARKET account alone (no account index exists, so it cannot
+            // reach the holders' mirrors), and after it the account still carries
+            // `source_lien_effective_reserved` for principal the market has moved
+            // to `impaired_liened_backing_num`. spec.md:562 ( = av:657): "An
+            // impaired lien cannot support new risk or payout ... until it
+            // deleverages, liquidates, ADLs, refreshes with new backing, or
+            // recovers"; spec.md:364 ( = av:452): impaired lien backing "is not
+            // available for new credit and does not count toward
+            // `available_backing_num`". Crediting it here is that same
+            // double-count one level up, and it is load-bearing: it zeroes
+            // `certified_liq_deficit`, so `liquidate_account_not_atomic` refuses
+            // with `NonProgress` — impairment BLOCKS the resolution the spec
+            // names as required.
+            //
+            // Only the COUNTERPARTY share is dropped: the support is rebuilt from
+            // the two backing lanes rather than read off the account's scalar, so
+            // the insurance share — reserved against the domain's insurance
+            // reservation, not against this bucket — survives a bucket that is
+            // `Impaired`, `Expired`, `Empty`, or `Fresh`-but-lapsed. The
+            // `.min(source_lien_effective_reserved * BOUND_SCALE)` is a defensive
+            // ceiling: it re-derives the account's own claim without leaning on
+            // the `counterparty + insurance == effective * BOUND_SCALE` aggregate
+            // invariant that `SourceCreditLienAggregateProofV16::validate` pins.
+            // The `counterparty_backing_num == 0` short-circuit keeps an
+            // insurance-only lien off the market entirely, so this valuation path
+            // gains no new fallible call for such an account.
+            //
+            // The gate yields ZERO; it does not `?`-propagate `Stale` the way the
+            // unliened branch below does. That is deliberate: an `Err` here would
+            // make `account_haircut_equity` fail, leaving the account
+            // uncertifiable and therefore un-liquidatable — the same liveness
+            // hole in a different costume. Dropping the term lowers
+            // `certified_equity`, raises `certified_liq_deficit` and lets
+            // liquidation proceed.
+            //
+            // Proof: `closure_expired_counterparty_lien_cannot_remain_favorable_account_credit`
+            // in `tests/proofs_v16.rs`, ported from `faa3bcf9`'s `src/v16_proofs.rs`.
+            let counterparty_backing_num = source.source_lien_counterparty_backing_num.get();
+            let current_counterparty_backing_num = if counterparty_backing_num == 0 {
+                0
+            } else {
+                let bucket = self.backing_bucket_for_domain(d)?;
+                if bucket.status == BackingBucketStatusV16::Fresh
+                    && bucket.expiry_slot > self.header.current_slot.get()
+                {
+                    counterparty_backing_num
+                } else {
+                    0
+                }
+            };
+            let valid_lien_effective_num = current_counterparty_backing_num
+                .checked_add(source.source_lien_insurance_backing_num.get())
+                .ok_or(V16Error::ArithmeticOverflow)?
+                .min(
+                    source
+                        .source_lien_effective_reserved
+                        .get()
+                        .checked_mul(BOUND_SCALE)
+                        .ok_or(V16Error::ArithmeticOverflow)?,
+                )
+                .min(remaining_num);
+            if valid_lien_effective_num != 0 {
                 support = support
-                    .checked_add(valid_lien_effective)
+                    .checked_add(valid_lien_effective_num / BOUND_SCALE)
                     .ok_or(V16Error::ArithmeticOverflow)?;
-                remaining_num = remaining_num
-                    .checked_sub(
-                        valid_lien_effective
-                            .checked_mul(BOUND_SCALE)
-                            .ok_or(V16Error::ArithmeticOverflow)?,
-                    )
-                    .ok_or(V16Error::CounterUnderflow)?;
+                remaining_num -= valid_lien_effective_num;
             }
             let claim_num = source
                 .source_claim_bound_num
@@ -13363,6 +13423,21 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         face_claim: u128,
     ) -> V16Result<u128> {
         self.account_unliened_source_realizable_support(account, face_claim)
+    }
+
+    // Shim for the C-S-04 / item R harness
+    // `closure_expired_counterparty_lien_cannot_remain_favorable_account_credit`.
+    // Upstream's copy of that proof lives in `src/v16_proofs.rs`, a private child
+    // module of `v16`, so it calls `account_source_realizable_support` directly;
+    // this fork keeps its proofs in the out-of-crate `tests/proofs_v16.rs`, which
+    // needs a `pub` entry point.
+    #[cfg(kani)]
+    pub fn kani_account_source_realizable_support(
+        &self,
+        account: &PortfolioV16View<'_>,
+        face_claim: u128,
+    ) -> V16Result<u128> {
+        self.account_source_realizable_support(account, face_claim)
     }
 
     fn reserve_new_capital_backed_loss_for_source_domain_not_atomic(
