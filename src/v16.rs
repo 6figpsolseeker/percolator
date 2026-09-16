@@ -21423,21 +21423,87 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
     ///
     /// `AssetLifecycleV16::Recovery` still admits unconditionally through the second disjunct
     /// (the owner exit a recovering asset relies on), and market-wide `MarketModeV16::Recovery`
-    /// through the first; the third disjunct now adds only `Retired`, the terminal lifecycle.
+    /// through the first; the third disjunct adds `Retired`, the terminal lifecycle, and the
+    /// zero-exposure `DrainOnly` wind-down below.
+    ///
+    /// # The lifecycle-`DrainOnly` wind-down arm (F-04-L)
+    ///
+    /// Requiring `Recovery | Retired` alone leaves a lifecycle-`DrainOnly` asset that still holds
+    /// a dead counterparty leg with NO owner-callable exit at all: `retire_empty_asset_not_atomic`
+    /// refuses while the leg is stored, a second unilateral reduce refuses once the opposite side
+    /// is `ResetPending`, and only an admin `force_asset_recovery_not_atomic` (wrapper
+    /// `ASSET_ACTION_SHUTDOWN`, marketauth or asset_admin) can move it on. That contradicts
+    /// `av spec.md:1621-1623`, which makes the owner-authorized "dead-leg forfeit/detach" route a
+    /// MUST-expose for user exits, and it breaks the documented prediction-slot wind-down
+    /// (drain -> clear both sides -> retire -> reuse the slot) that upstream regression-tests in
+    /// `aeyakovenko/percolator-prog` `b4ff060e` ("Add v16 prediction asset lifecycle regression")
+    /// and `74c31b39` ("v16 scope hybrid oracle to asset zero"), where the owner forfeit is
+    /// `.unwrap()`ed on an asset the same test proves is `DrainOnly` and not `Retired`.
+    ///
+    /// So the arm is re-admitted, but ONLY where the forfeit provably cannot create the
+    /// `oi_eff_long != oi_eff_short` asymmetry that `av spec.md:946` ("For every
+    /// Active/DrainOnly/Recovery asset side:") + `av spec.md:952` ("if Live:
+    /// OI_eff_long == OI_eff_short") forbid -- i.e. where the pair is ALREADY `0 == 0`.
+    ///
+    /// The invariant argument is a write-site argument, not a search result. The forfeit's ONLY
+    /// `oi_eff` writes are `kernel_clear_leg`'s `oi_eff_<side> -= clear_effective_oi_q`
+    /// (`:1472` long / `:1498` short) and `kernel_retain_leg_as_pending_obligation`'s
+    /// `oi_eff_<side> -= retained_effective_oi_q` (`:1302` / `:1312`) -- every one a `checked_sub`
+    /// on the FORFEITED side alone; the file's remaining `oi_eff` assignments (`:744` / `:758`
+    /// add-position, `:964` / `:972` resize, `:17781` / `:17788` the paired unilateral-close
+    /// reducer) are not in this call tree. With both sides already at zero every such subtraction
+    /// is either of zero -- `kernel_clear_leg` pins `clear_effective_oi_q == 0` on the
+    /// `prior_reset_epoch` / zero-basis branch (`:1428-1432`) -- or it underflows and fails closed
+    /// with `CounterUnderflow` (and `kernel_retain_leg_as_pending_obligation` rejects
+    /// `retained_effective_oi_q == 0` outright, `:1295`). `0 - 0 == 0` and `0 - n` cannot commit,
+    /// so the pair stays `0 == 0` across the instruction and the matched-book conjunct of
+    /// `validate_asset_shape_for_view` is satisfied verbatim, not exempted.
+    ///
+    /// `oi_eff_long_q == 0 && oi_eff_short_q == 0` IS the engine's own statement of "no live
+    /// counterparty leg on this asset": effective open interest is the sum of each side's live
+    /// legs' effective quantities, so a zero pair means nothing on either side still carries
+    /// exposure and only dead stored basis remains (`leg_has_exhausted_effective_oi` `:21515`
+    /// names the same condition per side).
+    ///
+    /// The precondition is admin-scoped while the exit stays owner-callable: lifecycle
+    /// `DrainOnly` is reachable only through `mark_asset_drain_only_not_atomic`, whose sole
+    /// wrapper caller is marketauth-gated, so no attacker manufactures the state -- which is the
+    /// shape `av spec.md:65` requirement 30 ("bounded owner-callable dead-leg forfeit/detach")
+    /// asks for. X-01's Active/Live shape is untouched: an `Active` lifecycle admits through no
+    /// disjunct here.
     fn leg_is_dead_for_forfeit(&self, asset_index: usize, side: SideV16) -> V16Result<bool> {
         let side_mode = self.side_mode_for(asset_index, side)?;
-        let asset_lifecycle = self.asset_state(asset_index)?.lifecycle;
+        let asset = self.asset_state(asset_index)?;
+        let asset_lifecycle = asset.lifecycle;
+        let no_live_counterparty_exposure = asset.oi_eff_long_q == 0 && asset.oi_eff_short_q == 0;
         Ok(
             decode_market_mode(self.header.mode)? == MarketModeV16::Recovery
                 || asset_lifecycle == AssetLifecycleV16::Recovery
                 || (matches!(
                     side_mode,
                     SideModeV16::DrainOnly | SideModeV16::ResetPending
-                ) && matches!(
+                ) && (matches!(
                     asset_lifecycle,
                     AssetLifecycleV16::Recovery | AssetLifecycleV16::Retired
-                )),
+                ) || (asset_lifecycle == AssetLifecycleV16::DrainOnly
+                    && no_live_counterparty_exposure))),
         )
+    }
+
+    /// Kani-only re-export of the private classifier, so
+    /// `proof_v16_forfeit_dead_leg_classifier_is_exact_with_drainonly_wind_down`
+    /// (`tests/proofs_v16.rs`) can prove the admission set EXACTLY over symbolic
+    /// mode x lifecycle x side mode x `oi_eff` pair. Mirrors upstream's
+    /// `MarketGroupV16ViewMut::kani_leg_is_dead_for_forfeit`
+    /// (`aeyakovenko/percolator` `a2d7c75c:src/v16_kani_api.rs:629-635`); compiled out of every
+    /// non-Kani build, so the production surface is unchanged.
+    #[cfg(kani)]
+    pub fn kani_leg_is_dead_for_forfeit(
+        &self,
+        asset_index: usize,
+        side: SideV16,
+    ) -> V16Result<bool> {
+        self.leg_is_dead_for_forfeit(asset_index, side)
     }
 
     fn settle_forfeited_leg_kf_effects(

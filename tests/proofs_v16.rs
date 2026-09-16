@@ -19841,3 +19841,136 @@ fn proof_v16_kernel_settle_principal_exact_paid_and_conservation() {
         }
     }
 }
+
+// =================================================================================================
+// F-04-L — the forfeit dead-leg admission classifier, proved EXACT over the widened predicate.
+//
+// `leg_is_dead_for_forfeit` is the whole of the tag-43 admission decision: it has exactly one
+// caller (`forfeit_recovery_leg_not_atomic`) and the wrapper's `handle_forfeit_recovery_leg` has
+// no lifecycle preflight of its own, so this predicate IS the gate. F-04 narrowed it and F-04-L
+// re-admitted the zero-exposure `DrainOnly` wind-down; this harness pins the resulting admission
+// set exactly, so neither the narrowing nor the widening can drift unnoticed.
+//
+// It is the counterpart of upstream's `proof_v16_forfeit_dead_leg_classifier_is_exact`
+// (`aeyakovenko/percolator` `a2d7c75c`, on `av/codex/resolved-unattributed-baddebt-progress`
+// only — NOT an ancestor of the `av` tip and not carried in this tree), which asserted the
+// pre-F-04 unqualified predicate and pinned the `oi_eff` pair in its fixture. This one makes the
+// pair SYMBOLIC, which is what the widened arm keys on.
+#[kani::proof]
+#[kani::unwind(8)]
+#[kani::solver(cadical)]
+fn proof_v16_forfeit_dead_leg_classifier_is_exact_with_drainonly_wind_down() {
+    let mode_raw: u8 = kani::any();
+    let lifecycle_raw: u8 = kani::any();
+    let side_mode_raw: u8 = kani::any();
+    let long_side: bool = kani::any();
+    let oi_eff_long_q: u128 = kani::any();
+    let oi_eff_short_q: u128 = kani::any();
+    kani::assume(mode_raw <= 2);
+    kani::assume(lifecycle_raw <= 5);
+    kani::assume(side_mode_raw <= 2);
+    kani::assume(oi_eff_long_q <= MAX_OI_SIDE_Q);
+    kani::assume(oi_eff_short_q <= MAX_OI_SIDE_Q);
+
+    // `encode_asset_lifecycle` / `decode_asset_lifecycle` (`src/v16.rs:23183-23208`).
+    let lifecycle = match lifecycle_raw {
+        0 => AssetLifecycleV16::Disabled,
+        1 => AssetLifecycleV16::PendingActivation,
+        2 => AssetLifecycleV16::Active,
+        3 => AssetLifecycleV16::DrainOnly,
+        4 => AssetLifecycleV16::Retired,
+        _ => AssetLifecycleV16::Recovery,
+    };
+    let selected_side_mode = match side_mode_raw {
+        0 => SideModeV16::Normal,
+        1 => SideModeV16::DrainOnly,
+        _ => SideModeV16::ResetPending,
+    };
+    let side = if long_side {
+        SideV16::Long
+    } else {
+        SideV16::Short
+    };
+
+    let (mut header, mut markets) = one_market_only_fixture();
+    // `decode_market_mode` (`src/v16.rs:23218-23225`): 0 Live, 1 Resolved, 2 Recovery.
+    header.mode = mode_raw;
+    let mut asset = markets[0].engine.asset.try_to_runtime().unwrap();
+    asset.lifecycle = lifecycle;
+    asset.oi_eff_long_q = oi_eff_long_q;
+    asset.oi_eff_short_q = oi_eff_short_q;
+    if long_side {
+        asset.mode_long = selected_side_mode;
+        asset.mode_short = SideModeV16::Normal;
+    } else {
+        asset.mode_long = SideModeV16::Normal;
+        asset.mode_short = selected_side_mode;
+    }
+    markets[0].engine.asset = AssetStateV16Account::from_runtime(&asset);
+    let market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+
+    let dead = market.kani_leg_is_dead_for_forfeit(0, side).unwrap();
+
+    let side_is_dead = selected_side_mode == SideModeV16::DrainOnly
+        || selected_side_mode == SideModeV16::ResetPending;
+    let zero_pair = oi_eff_long_q == 0 && oi_eff_short_q == 0;
+    // The admission set, written out as the union the fix claims:
+    //   {market Recovery} u {lifecycle Recovery}
+    //   u {side-mode dead ^ lifecycle in {Recovery, Retired}}
+    //   u {side-mode dead ^ lifecycle DrainOnly ^ oi_eff pair == 0}
+    let expected = mode_raw == 2
+        || lifecycle == AssetLifecycleV16::Recovery
+        || (side_is_dead
+            && (lifecycle == AssetLifecycleV16::Recovery
+                || lifecycle == AssetLifecycleV16::Retired
+                || (lifecycle == AssetLifecycleV16::DrainOnly && zero_pair)));
+    assert_eq!(dead, expected);
+
+    // One cover per arm of the union, plus the two rejections the gate exists for.
+    kani::cover!(
+        dead && mode_raw == 2 && !side_is_dead && lifecycle != AssetLifecycleV16::Recovery,
+        "forfeit classifier covers market-wide Recovery"
+    );
+    kani::cover!(
+        dead && mode_raw != 2 && lifecycle == AssetLifecycleV16::Recovery && !side_is_dead,
+        "forfeit classifier covers lifecycle Recovery"
+    );
+    kani::cover!(
+        dead && mode_raw != 2
+            && lifecycle == AssetLifecycleV16::Retired
+            && selected_side_mode == SideModeV16::DrainOnly,
+        "forfeit classifier covers the Retired arm with a DrainOnly side"
+    );
+    kani::cover!(
+        dead && mode_raw != 2
+            && lifecycle == AssetLifecycleV16::Retired
+            && selected_side_mode == SideModeV16::ResetPending,
+        "forfeit classifier covers the Retired arm with a ResetPending side"
+    );
+    kani::cover!(
+        dead && mode_raw != 2
+            && lifecycle == AssetLifecycleV16::DrainOnly
+            && selected_side_mode == SideModeV16::DrainOnly
+            && zero_pair,
+        "F-04-L: forfeit classifier covers the zero-exposure DrainOnly wind-down (DrainOnly side)"
+    );
+    kani::cover!(
+        dead && mode_raw != 2
+            && lifecycle == AssetLifecycleV16::DrainOnly
+            && selected_side_mode == SideModeV16::ResetPending
+            && zero_pair,
+        "F-04-L: forfeit classifier covers the zero-exposure DrainOnly wind-down (ResetPending side)"
+    );
+    kani::cover!(
+        !dead
+            && mode_raw != 2
+            && lifecycle == AssetLifecycleV16::DrainOnly
+            && side_is_dead
+            && !zero_pair,
+        "F-04-L: forfeit classifier still REFUSES a DrainOnly asset that carries effective OI"
+    );
+    kani::cover!(
+        !dead && mode_raw != 2 && lifecycle == AssetLifecycleV16::Active && side_is_dead,
+        "X-01: forfeit classifier still REFUSES a dead side mode on an Active asset"
+    );
+}
