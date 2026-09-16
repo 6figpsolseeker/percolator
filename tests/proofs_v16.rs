@@ -15652,6 +15652,126 @@ fn proof_v16_adl_kf_settlement_is_account_partition_invariant_and_zero_sum() {
     assert_eq!(long_split + short_split, 0);
 }
 
+// ---------------------------------------------------------------------------
+// KANI-NSLC: the harness for the PRODUCTION KERNEL
+// `V16Core::kernel_normalize_social_loss_carry` (`src/v16.rs:1516`), which
+// folds a side's sub-atom social-loss remainder and dust into a normalized
+// dust term plus a side-local explicit-loss counter. Every direct caller
+// (`kernel_begin_full_drain_reset` at three call sites, `src/v16.rs:1447,
+// 1554, 1583`) re-derives its own expected output inline rather than driving
+// the kernel's shim directly, so the kernel itself had no harness of its own
+// -- the gap F-02-KANI found for its settlement-ledger sibling, here for the
+// social-loss-carry kernel.
+//
+// Upstream `av` (`aeyakovenko/percolator`) DOES cover this exact kernel, but
+// through a different mechanism this fork does not carry: a Kani function
+// contract (`#[kani::ensures(...)]` on the function, `av/src/v16.rs:2796`)
+// discharged by `#[kani::proof_for_contract(kernel_normalize_social_loss_
+// carry)]` (`av/src/v16_proofs.rs:1701`), gated behind a `contracts` Cargo
+// feature this fork's `Cargo.toml` does not define. The upstream `ensures`
+// clause is the same postcondition asserted by hand below (clamp, exact
+// conservation of the crossed atom, and saturating-not-wrapping monotonicity
+// of the explicit-loss counter), which independently corroborates it. This
+// harness follows the house style of the sibling F-02
+// `proof_v16_kernel_settle_close_ledger_principal_rank_witness` above: fully
+// symbolic inputs, no `kani::assume` on `remainder`/`dust` because the
+// kernel's own guard is the precondition split (in range vs. out of range),
+// exact postconditions, and a named cover per branch.
+#[kani::proof]
+#[kani::unwind(4)]
+#[kani::solver(cadical)]
+fn proof_v16_kernel_normalize_social_loss_carry_clamped_and_conserved() {
+    let remainder: u128 = kani::any();
+    let dust: u128 = kani::any();
+    let explicit_loss: u128 = kani::any();
+
+    // The kernel's own guard IS the precondition: `remainder` and `dust` must
+    // each already be a normalized sub-atom carry (`< SOCIAL_LOSS_DEN`), which
+    // is exactly what every real caller holds (`kernel_begin_full_drain_reset`
+    // stores `social_loss_remainder_*_num`/`social_loss_dust_*_num`, both of
+    // which are themselves outputs of a prior call to this same kernel, or
+    // zero). No `kani::assume` narrows the domain: both sides of the guard are
+    // reachable from unconstrained `u128::any()`, and the solver explores both.
+    let valid = remainder < SOCIAL_LOSS_DEN && dust < SOCIAL_LOSS_DEN;
+    // Only meaningful when `valid`: no wraparound is possible there because
+    // the sum of two values each `< SOCIAL_LOSS_DEN` (1e21) is far below
+    // `u128::MAX` (~3.4e38).
+    let total = remainder.wrapping_add(dust);
+    let crossed_atom = total >= SOCIAL_LOSS_DEN;
+    let expected_dust = if crossed_atom {
+        total - SOCIAL_LOSS_DEN
+    } else {
+        total
+    };
+    let expected_explicit = explicit_loss.saturating_add(u128::from(crossed_atom));
+
+    let result = MarketGroupV16ViewMut::<u64>::kani_kernel_normalize_social_loss_carry(
+        remainder,
+        dust,
+        explicit_loss,
+    );
+
+    kani::cover!(
+        !valid,
+        "guard rejects an out-of-range remainder or dust (InvalidConfig)"
+    );
+    kani::cover!(
+        valid && !crossed_atom,
+        "no-carry arm: the sum stays sub-atom, dust only accumulates"
+    );
+    kani::cover!(
+        valid && crossed_atom,
+        "carry arm: the sum crosses one whole atom, one explicit-loss unit is recorded"
+    );
+    kani::cover!(
+        valid && crossed_atom && explicit_loss == u128::MAX,
+        "the explicit-loss counter saturates instead of overflowing at the top of its range"
+    );
+    kani::cover!(
+        valid && crossed_atom && explicit_loss < u128::MAX,
+        "the explicit-loss counter increments by exactly the one atom crossed"
+    );
+
+    if !valid {
+        assert_eq!(result, Err(V16Error::InvalidConfig));
+        return;
+    }
+
+    // The guard admits the input => `checked_add` can never overflow (the max
+    // sum is `< 2 * SOCIAL_LOSS_DEN`, nowhere near `u128::MAX`), so the kernel
+    // is infallible on every validated input: the `ArithmeticOverflow` arm is
+    // unreachable here, matching the F-02 "fails-closed is unreachable" style.
+    assert!(result.is_ok());
+    let (next_dust, next_explicit) = result.unwrap();
+
+    // (1) exact conservation: the pair (next_dust, whole atoms crossed)
+    // reconstructs the original sum exactly -- normalization moves value
+    // between the dust term and the atom count, it never creates or destroys
+    // it.
+    assert_eq!(next_dust, expected_dust);
+    assert_eq!(
+        next_dust + if crossed_atom { SOCIAL_LOSS_DEN } else { 0 },
+        total
+    );
+
+    // (2) the clamp: the returned dust is always `< SOCIAL_LOSS_DEN`, so it is
+    // itself a valid `remainder`/`dust` input to the NEXT call -- the
+    // fractional carry never re-accumulates a whole atom.
+    assert!(next_dust < SOCIAL_LOSS_DEN);
+
+    // (3) the explicit-loss audit counter is monotone non-decreasing and moves
+    // by exactly {0, 1} atom, saturating (never wrapping) at `u128::MAX`. Using
+    // `saturating_add` here (not `+`) mirrors the kernel's own operation, so
+    // this check cannot itself overflow when `explicit_loss == u128::MAX`.
+    assert_eq!(next_explicit, expected_explicit);
+    assert!(next_explicit >= explicit_loss);
+    if crossed_atom {
+        assert_eq!(next_explicit, explicit_loss.saturating_add(1));
+    } else {
+        assert_eq!(next_explicit, explicit_loss);
+    }
+}
+
 // A partial ADL can leave stored basis after matched effective OI reaches zero.
 // Prove the exact production reset+clear composition: reset preserves the old
 // K/F/B epoch targets, and the prior-epoch clear cannot subtract basis or loss
