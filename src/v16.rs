@@ -8694,7 +8694,7 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         self.validate_shape_audit_scan()
     }
 
-    #[cfg(kani)]
+    #[cfg(any(test, kani, feature = "audit-scan"))]
     pub fn refresh_header_aggregate_totals_for_test(&mut self) -> V16Result<()> {
         let totals = self
             .as_view()
