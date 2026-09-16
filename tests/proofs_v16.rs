@@ -19973,6 +19973,8 @@ fn proof_v16_forfeit_dead_leg_classifier_is_exact_with_drainonly_wind_down() {
         !dead && mode_raw != 2 && lifecycle == AssetLifecycleV16::Active && side_is_dead,
         "X-01: forfeit classifier still REFUSES a dead side mode on an Active asset"
     );
+}
+
 /// Two active assets, constructor-equivalent POD state — the fixture upstream's
 /// `closure_*` source-lien proofs use (`av/codex/lof-dos-proof-sweep-20260712:
 /// src/v16_proofs.rs::two_asset_kf_mapping_fixture`), ported here verbatim so the

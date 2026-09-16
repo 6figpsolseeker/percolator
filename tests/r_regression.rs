@@ -695,6 +695,30 @@ fn r_regression_insurance_backed_lien_survives_a_dead_counterparty_bucket() {
             insurance_credit_reserved_num: insurance_num,
             ..InsuranceCreditReservationV16::EMPTY
         });
+    // AS-05 class: `insurance_credit_reserved_num` is not free-standing — it is
+    // drawn against the domain's OWN insurance budget, and
+    // `validate_domain_shape_for_view` (src/v16.rs:8626-8653) enforces
+    // `spent + reserved_atoms <= budget` per domain (the final conjunct at
+    // :8672-8680) before `validate_shape_full_audit_scan`'s header-aggregate
+    // comparison (:8426-8442, `insurance_domain_budget_remaining_atoms`) is even
+    // reached. The only production writer that ever raises a domain's reservation,
+    // `set_domain_insurance_budget_core`/`domain_insurance_budget_spent`
+    // (:11329-11437), always keeps `insurance_domain_budget_{long,short}` and
+    // `header.insurance_domain_budget_remaining_total` moving together in the same
+    // call. The raw field write above bypassed that pairing, leaving
+    // `insurance_domain_budget_long = 0` under a live `insurance_atoms`-atom
+    // reservation (`spent=0, reserved_atoms=insurance_atoms=10, budget=0` —
+    // measured via non-short-circuiting instrumentation of
+    // `validate_domain_shape_for_view`, panic at :8682 before rebase-onto-main
+    // put this fixture under `--features audit-scan --all-targets`, gated
+    // `#[cfg(any(test, kani, feature = "audit-scan"))]` so a plain `cargo test`
+    // never runs it (2c38570a onward the fixture predates this gate).
+    // Mirror it exactly as the engine would: the domain's insurance budget is
+    // sized to the reservation it backs (spent stays 0, so remaining ==
+    // insurance_atoms), and the header total is the sum of every domain's
+    // remaining budget (only this one domain is nonzero here).
+    markets[0].engine.insurance_domain_budget_long = V16PodU128::new(insurance_atoms);
+    header.insurance_domain_budget_remaining_total = V16PodU128::new(insurance_atoms);
     {
         let view = MarketGroupV16ViewMut::new(&mut header, &mut markets);
         view.validate_shape()
