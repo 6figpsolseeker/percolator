@@ -156,9 +156,9 @@ impl World {
 }
 
 /// Public entries only:
-///   1. three deposits (`deposit_not_atomic`, wrapper tag 1),
+///   1. three deposits (`deposit_not_atomic`, wrapper tag 3),
 ///   2. two opening trades L1/S and L2/S (`execute_trade_with_fee_loss_stale_scoped_not_atomic`,
-///      wrapper tag 3),
+///      wrapper tag 6),
 ///   3. `force_asset_recovery_not_atomic(0, 1)` — marketauth-gated `UpdateAssetLifecycle`,
 ///   4. L1's owner-signed dead-leg forfeit (`forfeit_recovery_leg_not_atomic`, wrapper tag 43).
 ///      On a `Recovery` asset whose opposite side still holds a real position,
