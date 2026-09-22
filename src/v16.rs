@@ -21087,6 +21087,12 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
                 if self.has_pending_domain_loss_barrier(asset_index, leg.side)? {
                     return Ok(());
                 }
+                if leg.basis_pos_q == 0
+                    && leg.loss_weight != 0
+                    && !self.recovery_pending_obligation_release_allowed(asset_index, leg.side)?
+                {
+                    return Ok(());
+                }
                 let asset = self.asset_state(asset_index)?;
                 if Self::leg_has_exhausted_effective_oi(asset, leg) {
                     self.begin_full_drain_reset_inner(asset_index, leg.side)?;
